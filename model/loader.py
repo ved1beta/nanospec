@@ -81,3 +81,41 @@ def load_model(
             )
         )
     return net.eval()
+
+
+def load_eagle3(model: str | os.PathLike, target: LlamaForCausalLM, backend: str = "auto"):
+    """EAGLE-3 head from a HF repo/dir holding config.json + pytorch_model.bin."""
+    from model.attention import FlashInferBackend, SdpaBackend, default_backend
+    from spec.drafter import Eagle3Config, Eagle3Head
+
+    path = Path(model)
+    if not path.is_dir():
+        from huggingface_hub import snapshot_download
+
+        path = Path(snapshot_download(str(model), allow_patterns=["config.json", "*.bin", "*.safetensors"]))
+    cfg = Eagle3Config.from_hf(json.loads((path / "config.json").read_text()), target.config)
+    p = target.lm_head.weight
+    device, dtype = p.device, p.dtype
+
+    bins = sorted(path.glob("*.safetensors"))
+    if bins:
+        state = {}
+        for shard in bins:
+            with safe_open(shard, framework="pt", device="cpu") as f:
+                state.update({k: f.get_tensor(k) for k in f.keys()})
+    else:
+        state = torch.load(next(path.glob("*.bin")), map_location="cpu", weights_only=True)
+    state.pop("t2d", None)
+    state = {k: v.to(device=device, dtype=dtype if v.is_floating_point() else v.dtype) for k, v in state.items()}
+
+    with torch.device("meta"):
+        head = Eagle3Head(cfg)
+    head.load_state_dict(state, strict=True, assign=True)
+    head.embed_tokens = target.model.embed_tokens
+    if backend == "auto":
+        head.backend = default_backend(cfg, device, dtype)
+    elif backend == "sdpa":
+        head.backend = SdpaBackend()
+    else:
+        head.backend = FlashInferBackend(cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, dtype, device)
+    return head.eval()

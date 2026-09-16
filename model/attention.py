@@ -14,6 +14,8 @@ from kv.cache import AttnMeta, PagedKVCache
 class SdpaBackend:
     """Reference path: gather each request's blocks and run torch SDPA. Any device."""
 
+    fused = False  # the model keeps HF's exact op order on this backend
+
     def plan(self, meta: AttnMeta) -> None:
         self.meta = meta
 
@@ -26,7 +28,10 @@ class SdpaBackend:
             k, v = kv.gather(layer, blocks, kv_len)
             qi = q[qs:qe].transpose(0, 1)[None]  # [1, H, S, D]
             ki, vi = k.transpose(0, 1)[None], v.transpose(0, 1)[None]
-            if q_len == 1:
+            mask = m.masks[i] if m.masks is not None else None
+            if mask is not None:
+                o = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=mask, enable_gqa=True)
+            elif q_len == 1:
                 o = F.scaled_dot_product_attention(qi, ki, vi, enable_gqa=True)
             elif q_len == kv_len:
                 o = F.scaled_dot_product_attention(qi, ki, vi, is_causal=True, enable_gqa=True)
@@ -39,7 +44,10 @@ class SdpaBackend:
 
 
 class FlashInferBackend:
-    """Paged prefill / decode wrappers. CUDA only."""
+    """Paged prefill / decode wrappers. CUDA only. `fused` switches the model to
+    FlashInfer's fused norm / RoPE kernels (fewer launches; not bit-exact vs HF)."""
+
+    fused = True
 
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int, dtype, device) -> None:
         import flashinfer
@@ -48,6 +56,8 @@ class FlashInferBackend:
         self.dtype = dtype
         self.workspace = torch.empty(128 << 20, dtype=torch.uint8, device=device)
         self.prefill = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace, "NHD")
+        # the Hopper (FA3) prefill kernel has no custom-mask support; tree verify / draft use FA2
+        self.prefill_masked = flashinfer.BatchPrefillWithPagedKVCacheWrapper(self.workspace, "NHD", backend="fa2")
         self.decode = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             self.workspace, "NHD", use_tensor_cores=num_heads // num_kv_heads >= 4
         )
@@ -61,7 +71,19 @@ class FlashInferBackend:
             q_data_type=self.dtype,
             kv_data_type=self.dtype,
         )
-        if meta.is_decode:
+        custom = meta.custom_mask
+        if custom is not None:
+            self.prefill_masked.plan(
+                meta.qo_indptr,
+                meta.kv_indptr,
+                meta.kv_indices,
+                meta.kv_last_page_len,
+                head_dim_qk=self.head_dim,
+                custom_mask=custom,
+                **common,
+            )
+            self.wrapper = self.prefill_masked
+        elif meta.is_decode:
             self.decode.plan(
                 meta.kv_indptr, meta.kv_indices, meta.kv_last_page_len, head_dim=self.head_dim, **common
             )

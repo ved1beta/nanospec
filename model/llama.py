@@ -136,6 +136,16 @@ class RotaryEmbedding(nn.Module):
             self._tables[key] = (emb.cos().to(dtype), emb.sin().to(dtype))
         return self._tables[key]
 
+    def cos_sin_cache(self, device: torch.device) -> torch.Tensor:
+        """fp32 [max_pos, head_dim] = [cos | sin] halves, the layout FlashInfer's fused RoPE wants."""
+        key = (device, torch.float32)
+        if key not in self._tables:
+            t = torch.arange(self.max_pos, dtype=torch.float32, device=device)
+            freqs = torch.outer(t, self.inv_freq.to(device))
+            self._tables[key] = (freqs.cos(), freqs.sin())
+        cos, sin = self._tables[key]
+        return torch.cat([cos, sin], dim=-1)
+
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
@@ -162,11 +172,15 @@ class Attention(nn.Module):
 
     def forward(self, x, cos, sin, layer: int, kv: "PagedKVCache", meta: "AttnMeta", backend) -> torch.Tensor:
         N = x.shape[0]
-        q = self.q_proj(x).view(N, self.n_heads, self.head_dim)
-        k = self.k_proj(x).view(N, self.n_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(N, self.n_kv_heads, self.head_dim)
-        q, k = apply_rope(q, k, cos, sin)
-        kv.write(layer, meta.slots, k, v)
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        if getattr(backend, "fused", False):  # one RoPE kernel; cos/sin here is the fp32 [cos|sin] cache
+            import flashinfer
+
+            flashinfer.rope.apply_rope_with_cos_sin_cache_inplace(meta.positions, q, k, self.head_dim, cos, is_neox=True)
+            q, k = q.view(N, self.n_heads, self.head_dim), k.view(N, self.n_kv_heads, self.head_dim)
+        else:
+            q, k = apply_rope(q.view(N, self.n_heads, self.head_dim), k.view(N, self.n_kv_heads, self.head_dim), cos, sin)
+        kv.write(layer, meta.slots, k, v.view(N, self.n_kv_heads, self.head_dim))
         return self.o_proj(backend.run(q, layer, kv).reshape(N, -1))
 
 
@@ -205,6 +219,8 @@ class LlamaModel(nn.Module):
     def forward(self, input_ids, kv, meta, backend, aux_layers=()) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """input_ids [N] flat over the batch. -> (normed hidden [N, hidden], residual stream entering each aux layer)"""
         x = self.embed_tokens(input_ids)
+        if getattr(backend, "fused", False):
+            return self._forward_fused(x, kv, meta, backend, aux_layers)
         cos, sin = self.rotary_emb.tables(x.device, x.dtype)
         cos, sin = cos[meta.positions], sin[meta.positions]
 
@@ -214,6 +230,28 @@ class LlamaModel(nn.Module):
                 aux.append(x)
             x = layer(x, cos, sin, i, kv, meta, backend)
         return self.norm(x), aux
+
+    def _forward_fused(self, x, kv, meta, backend, aux_layers):
+        """FlashInfer fused norm/residual/RoPE kernels: same math, fewer launches, one
+        rounding per op instead of HF's -- so not bit-exact vs HF (the SDPA path is)."""
+        from flashinfer.norm import fused_add_rmsnorm, rmsnorm
+
+        cs = self.rotary_emb.cos_sin_cache(x.device)
+        aux: list[torch.Tensor] = []
+        residual = None
+        for i, layer in enumerate(self.layers):
+            if residual is None:
+                residual = x
+                x = rmsnorm(x, layer.input_layernorm.weight, layer.input_layernorm.eps)
+            else:
+                fused_add_rmsnorm(x, residual, layer.input_layernorm.weight, layer.input_layernorm.eps)
+            if i in aux_layers:
+                aux.append(residual.clone())  # residual == stream entering layer i; mutated in place below
+            a = layer.self_attn(x, cs, None, i, kv, meta, backend)
+            fused_add_rmsnorm(a, residual, layer.post_attention_layernorm.weight, layer.post_attention_layernorm.eps)
+            x = layer.mlp(a)
+        fused_add_rmsnorm(x, residual, self.norm.weight, self.norm.eps)
+        return x, aux
 
 
 class LlamaForCausalLM(nn.Module):
@@ -235,10 +273,12 @@ class LlamaForCausalLM(nn.Module):
         meta: "AttnMeta",
         aux_layers: tuple[int, ...] = (),
         logits_idx: torch.Tensor | None = None,
+        backend=None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """input_ids [N] at meta.positions. -> (logits [N or len(logits_idx), V], aux hidden states)"""
-        self.backend.plan(meta)
-        h, aux = self.model(input_ids, kv, meta, self.backend, aux_layers)
+        backend = backend or self.backend
+        backend.plan(meta)
+        h, aux = self.model(input_ids, kv, meta, backend, aux_layers)
         if logits_idx is not None:
             h = h[logits_idx]
         return self.lm_head(h), aux
