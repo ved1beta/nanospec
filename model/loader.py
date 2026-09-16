@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+from model.attention import default_backend
 from model.llama import LlamaConfig, LlamaForCausalLM
 
 _PATTERNS = ["config.json", "generation_config.json", "*.safetensors", "*.safetensors.index.json"]
@@ -41,6 +42,7 @@ def load_model(
     model: str | os.PathLike,
     device: str | torch.device = "cuda",
     dtype: torch.dtype = torch.bfloat16,
+    backend: str = "auto",  # "auto" | "sdpa" | "flashinfer"
 ) -> LlamaForCausalLM:
     path = resolve_checkpoint(model)
     config = load_config(path)
@@ -66,4 +68,16 @@ def load_model(
     net.load_state_dict(state, strict=True, assign=True)
     if tied:
         net.tie_weights()
+    if backend == "auto":
+        net.backend = default_backend(config, device, dtype)
+    else:
+        from model.attention import FlashInferBackend, SdpaBackend
+
+        net.backend = (
+            SdpaBackend()
+            if backend == "sdpa"
+            else FlashInferBackend(
+                config.num_attention_heads, config.num_key_value_heads, config.head_dim, dtype, device
+            )
+        )
     return net.eval()

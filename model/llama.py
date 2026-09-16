@@ -1,301 +1,244 @@
+"""Llama-3 decoder.
+
+Module names and op order match HF `transformers` so weights load without remapping
+and greedy decode is bit-identical (G1). Tokens are flat [N] over the batch; the paged
+cache (kv/) and attention backend (model/attention.py) are passed in per step.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
 import torch
+import torch.nn.functional as F
 from torch import nn
 
-@dataclass
-class ModelArgs:
-    dim: int = 512              # embedding dimension
-    n_layers: int = 8           # number of model decoder blocks
-    n_heads: int = 8            # number of heads for queries embedding
-    n_kv_heads: int = 4         # number of heads for keys and values embedding
-    vocab_size: int = len(vocab) # Length of vocabulary
-    multiple_of: int = 256        # Require to calculate dim of feedfoward network
-    ffn_dim_multiplier: Optional[float] = None  # Require to calculate dim of feedfoward network
-    norm_eps: float = 1e-5                       # Default Epsilon value set for the RMSNorm calculation
-    rope_theta: float = 10000.0   # Default theta value for the RePE calculation
+if TYPE_CHECKING:
+    from kv.cache import AttnMeta, PagedKVCache
 
-    max_batch_size: int = 10     # Max batch size
-    max_seq_len: int = 256         # Max sequence length
 
-    epochs: int = 2500             # Total number of training iteration
-    log_interval: int = 10        # Number of interval to print the logs and loss values   
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'   # Assign device to cuda or cpu based on availability 
+@dataclass(frozen=True)
+class LlamaConfig:
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    rms_norm_eps: float
+    rope_theta: float
+    max_position_embeddings: int
+    rope_scaling: dict | None = None  # llama3 params, None for plain RoPE
+    tie_word_embeddings: bool = False
+    bos_token_id: int | None = None
+    eos_token_ids: tuple[int, ...] = field(default_factory=tuple)
+
+    @classmethod
+    def from_hf(cls, cfg: dict, generation_cfg: dict | None = None) -> "LlamaConfig":
+        if cfg.get("model_type") != "llama":
+            raise ValueError(f"not a llama config: model_type={cfg.get('model_type')!r}")
+        if cfg.get("attention_bias") or cfg.get("mlp_bias"):
+            raise ValueError("biased projections are not supported")
+
+        # transformers>=5 writes `rope_parameters`; older configs use `rope_theta` + `rope_scaling`
+        rope = dict(cfg.get("rope_parameters") or cfg.get("rope_scaling") or {})
+        rope_theta = float(rope.pop("rope_theta", cfg.get("rope_theta", 10000.0)))
+        rope_type = rope.pop("rope_type", rope.pop("type", "default"))
+        if rope_type == "default":
+            rope_scaling = None
+        elif rope_type == "llama3":
+            rope_scaling = rope
+        else:
+            raise ValueError(f"unsupported rope_type {rope_type!r}")
+
+        heads = cfg["num_attention_heads"]
+        eos = cfg.get("eos_token_id")
+        if generation_cfg and generation_cfg.get("eos_token_id") is not None:
+            eos = generation_cfg["eos_token_id"]
+        eos_ids = tuple(eos) if isinstance(eos, (list, tuple)) else ((eos,) if eos is not None else ())
+
+        return cls(
+            vocab_size=cfg["vocab_size"],
+            hidden_size=cfg["hidden_size"],
+            intermediate_size=cfg["intermediate_size"],
+            num_hidden_layers=cfg["num_hidden_layers"],
+            num_attention_heads=heads,
+            num_key_value_heads=cfg.get("num_key_value_heads", heads),
+            head_dim=cfg.get("head_dim") or cfg["hidden_size"] // heads,
+            rms_norm_eps=cfg.get("rms_norm_eps", 1e-5),
+            rope_theta=rope_theta,
+            max_position_embeddings=cfg["max_position_embeddings"],
+            rope_scaling=rope_scaling,
+            tie_word_embeddings=bool(cfg.get("tie_word_embeddings", False)),
+            bos_token_id=cfg.get("bos_token_id"),
+            eos_token_ids=eos_ids,
+        )
+
+
+def eagle3_aux_layers(num_layers: int) -> tuple[int, int, int]:
+    """Layers whose input residual stream EAGLE-3 taps (SGLang default; verify vs head config)."""
+    return (2, num_layers // 2, num_layers - 3)
 
 
 class RMSNorm(nn.Module):
-  def __init__(self, dim: int, eps: float = 1e-6):
-    super().__init__()
-    device = ModelArgs.device
-    self.eps = eps
-    # Scaling parameter gamma, initialized with one and the no of parameters is equal to the size of dim
-    self.weight = nn.Parameter(torch.ones(dim).to(device))
+    def __init__(self, dim: int, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
-  def _norm(self, x):
-    return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps).to(device)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x.float()
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + self.eps)
+        return self.weight * h.to(x.dtype)
 
-  def forward(self, x):
-    #Shape: x[bs,seq,dim]
-    output = self._norm(x.float()).type_as(x)
 
-    #Shape: x[bs,seq,dim] -> x_norm[bs,seq,dim]
-    return output * self.weight
+def compute_inv_freq(config: LlamaConfig) -> torch.Tensor:
+    """fp32 inverse frequencies, same expression as HF. Explicit cpu so meta-device init works."""
+    dim = config.head_dim
+    ar = torch.arange(0, dim, 2, dtype=torch.int64, device="cpu").float()
+    inv_freq = 1.0 / (config.rope_theta ** (ar / dim))
+    if config.rope_scaling is None:
+        return inv_freq
 
-def precompute_freqs_cis(dim:int, seq_len: int, theta: float=10000.0):
-  # Computing Theta value for each dim pair which is dim/2
-  device = ModelArgs.device
-  freqs = 1.0 / (theta ** (torch.arange(0, dim, 2,device=device)[:(dim//2)].float()/dim))
+    s = config.rope_scaling
+    factor = s["factor"]
+    low_freq_factor, high_freq_factor = s["low_freq_factor"], s["high_freq_factor"]
+    old_context_len = s["original_max_position_embeddings"]
 
-  # Computing range of positions(m) in the sequence
-  t = torch.arange(seq_len, dtype=torch.float32, device=device)
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    wavelen = 2 * math.pi / inv_freq
+    inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    smooth = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smoothed = (1 - smooth) * inv_freq_llama / factor + smooth * inv_freq_llama
+    is_medium = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+    return torch.where(is_medium, smoothed, inv_freq_llama)
 
-  # freqs gives all the Theta value range for all the position of tokens in the sequence
-  freqs = torch.outer(t, freqs).to(device)
 
-  # This is the rotation matrix which needs to be converted to Polar form in order to perform rotation to the embedding
-  freqs_cis = torch.polar(torch.ones_like(freqs).to(device), freqs).to(device)
-  return freqs_cis
+class RotaryEmbedding(nn.Module):
+    """cos/sin tables [max_pos, head_dim], built lazily per (device, dtype)."""
 
-def reshape_for_broadcast(freqs_cis, x):
-  ndim = x.ndim
-  assert 0<=1<ndim
-  assert freqs_cis.shape == (x.shape[1],x.shape[-1]), "the last two dimension of freqs_cis, x must match"
-  shape = [d if i==1 or i==ndim-1 else 1 for i,d in enumerate(x.shape)]
-  return freqs_cis.view(*shape)
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.inv_freq = compute_inv_freq(config)
+        self.max_pos = config.max_position_embeddings
+        self._tables: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 
-def apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor)->Tuple[torch.Tensor, torch.Tensor]:
-  device = ModelArgs.device
-  # Applying rotary positional encoding to both query and key embedding together
-  # First: The last dimension of xq and xk embedding needs to be reshaped to make it a pair. As rotation matrix is applied to each pair of dim.
-  # Next: convert both xq and xk to complex number as the rotation matrix is only applicable to complex number
-  xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2)).to(device)    #xq_:[bsz, seq_len, n_heads, head_dim/2]
-  xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2)).to(device)    #xk_:[bsz, seq_len, n_heads, head_dim/2]
+    def tables(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (device, dtype)
+        if key not in self._tables:
+            t = torch.arange(self.max_pos, dtype=torch.float32, device=device)
+            freqs = torch.outer(t, self.inv_freq.to(device))
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self._tables[key] = (emb.cos().to(dtype), emb.sin().to(dtype))
+        return self._tables[key]
 
-  # The rotation matrix(freqs_cis) dimensions across seq_len(dim=1) and head_dim(dim=3) should match with the embedding
-  # Also, the shape freqs_cis should be the same with xq and xk, hence change the shape of freqs_cis:[seq_len,head_dim] -> freqs_cis:[1,seq_len,1,head_dim]
-  freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
 
-  #Finally, perform rotation operation by multiplying with freqs_cis.
-  #After the rotation is completed, convert both xq_out and xk_out back to real number and return
-  xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3).to(device) #xq_out:[bsz, seq_len, n_heads, head_dim]
-  xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3).to(device) #xk_out:[bsz, seq_len, n_heads, head_dim]
-  return xq_out.type_as(xq), xk_out.type_as(xk)
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    # q, k: [N, H, D]; cos, sin: [N, D]
+    cos, sin = cos[:, None], sin[:, None]
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
 
 class Attention(nn.Module):
-  def __init__(self, args: ModelArgs):
-    super().__init__()
-    self.args = args
-    # Embedding dimension
-    self.dim = args.dim
-    # Number of heads assigned to Query
-    self.n_heads = args.n_heads
-    # Number of heads assigned to Key and values. If "None", the number will be same as Query.
-    self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-    # Dimension of each head relative to model dimension
-    self.head_dim = args.dim // args.n_heads
-    # Number of repetition in order to make time Key, Value heads to match Query heads number
-    self.n_rep = args.n_heads // args.n_kv_heads
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.n_heads = config.num_attention_heads
+        self.n_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        hs = config.hidden_size
+        self.q_proj = nn.Linear(hs, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(hs, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hs, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, hs, bias=False)
 
-    # Weight initialize for Keys, Querys, Values and Oupt. Notice that the out_feature value of weight for q and kv are based on it's heads
-    self.wq = nn.Linear(self.dim, self.n_heads * self.head_dim, bias=False, device=device)
-    self.wk = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False, device=device)
-    self.wv = nn.Linear(self.dim, self.n_kv_heads * self.head_dim, bias=False, device=device)
-    self.wo = nn.Linear(self.n_heads * self.head_dim, self.dim, bias=False, device=device)
-
-    # Initialize caches to store Key, Values at start. (KV Cache Implementation)
-    self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), device=args.device)
-    self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim), device=args.device)
-
-  def forward(self, x: torch.Tensor, start_pos, inference):
-    # Shape of the input embedding: [bsz,seq_len,dim]
-    bsz, seq_len, _ = x.shape
-    # Mask will be used during 'Training' and is not required for 'inference' due to the use of KV cache.
-    mask = None
-
-    xq = self.wq(x)  #x[bsz,seq_len,dim]*wq[dim,n_heads * head_dim] -> q[bsz,seq_len,n_heads * head_dim]
-    xk = self.wk(x)  #x[bsz,seq_len,dim]*wq[dim,n_kv_heads * head_dim] -> k[bsz,seq_len,n_kv_heads * head_dim]
-    xv = self.wv(x)  #x[bsz,seq_len,dim]*wq[dim,n_kv_heads * head_dim] -> v[bsz,seq_len,n_kv_heads * head_dim]
-
-    # Reshaping Querys, Keys and Values by their number of heads. (Group Query Attention Implementation)
-    xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)      #xq[bsz,seq_len,n_heads, head_dim]
-    xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)   #xk[bsz,seq_len,n_kv_heads, head_dim]
-    xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)   #xv[bsz,seq_len,n_kv_heads, head_dim]
-
-    # Model - Inference Mode: kv-cache is enabled at inference mode only.
-    if inference:
-      # Compute rotation matrix for each position in the sequence
-      freqs_cis = precompute_freqs_cis(dim=self.head_dim, seq_len=self.args.max_seq_len * 2)
-      # During inferencing, we should only take the rotation matrix range from the current position of the tokens.
-      freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
-      # Apply RoPE to Queries and Keys embeddings
-      xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
-
-      self.cache_k = self.cache_k.to(xq)
-      self.cache_v = self.cache_v.to(xq)
-      # Store Keys and Values token embedding into their respective cache [KV Cache Implementation]
-      self.cache_k[:bsz, start_pos:start_pos + seq_len] = xk
-      self.cache_v[:bsz, start_pos:start_pos + seq_len] = xv
-
-      # Assign all the previous tokens embeddings upto current tokens position to Keys and Values variable for Attention Calculation
-      keys = self.cache_k[:bsz, :start_pos + seq_len]
-      values = self.cache_v[:bsz, :start_pos + seq_len]
-
-      # At this point, they Keys and Values shape aren't same with Queries Embedding which has to be in order to computer attention score
-      # Use repeat_kv function to make Keys,Values shape same as queries shape
-      keys = repeat_kv(keys, self.n_rep)      #keys[bsz,seq_len,n_heads,head_dim]
-      values = repeat_kv(values, self.n_rep)  #values[bsz,seq_len,n_heads,head_dim]
-
-    # Mode - Training mode: KV-Cache not implemented
-    else:
-      # Compute rotation matrix and apply RoPE to queries and keys for for training.
-      freqs_cis = precompute_freqs_cis(dim=self.head_dim, seq_len=self.args.max_seq_len)
-
-      #xq[bsz,seq_len,n_heads, head_dim], xk[bsz,seq_len,n_heads, head_dim]
-      xq, xk = apply_rotary_emb(xq, xk, freqs_cis)
-
-      # Use repeat_kv function to make Keys,Values shape same as the queries shape
-      #keys[bsz,seq_len,n_heads,head_dim], #values[bsz,seq_len,n_heads,head_dim]
-      keys = repeat_kv(xk, self.n_rep)
-      values = repeat_kv(xv, self.n_rep)
-
-      # For training mode, we'll compute mask and apply to the attention score later
-      mask = torch.full((seq_len, seq_len),float("-inf"),device=self.args.device)
-      mask = torch.triu(mask, diagonal=1).to(self.args.device)
-
-    # To compute attention, we'll need to perform a transpose operation to reshape all queries, keys and values bring heads at dim 1 and seq at dim 2
-    xq = xq.transpose(1,2)                  #xq[bsz,n_heads,seq_len,head_dim]
-    keys = keys.transpose(1,2)              #keys[bsz,n_heads,seq_len,head_dim]
-    values = values.transpose(1,2)          #values[bsz,n_heads,seq_len,head_dim]
-
-    # Computing attention score
-    scores = torch.matmul(xq, keys.transpose(2,3)).to(self.args.device)/math.sqrt(self.head_dim)
-    if mask is not None:
-      scores = scores + mask
-
-    # Apply softmax to the attention score
-    scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-    # Matrix multiplication of attention score with the values
-    output = torch.matmul(scores, values).to(self.args.device)
-
-    # We get the contextual embedding for each head
-    # All heads need to be reshaped back and combined to give a single single contextual attention output
-    # Shape change: output[bsz,n_heads,seq_len,head_dim] -> output[bsz,seq_len, n_heads,head_dim] -> output[bsz,seq_len, n_heads * head_dim]
-    output = output.transpose(1,2).contiguous().view(bsz, seq_len, -1)
-
-    # shape: output [bsz,seq_len,dim]
-    return self.wo(output)
-
-# If the number of keys/values heads is less than query heads, this function expands the key/values embeddings with the required number of repetition
-def repeat_kv(x:torch.Tensor, n_rep: int)-> torch.Tensor:
-  bsz, seq_len, n_kv_heads, head_dim = x.shape
-  if n_rep == 1:
-    return x
-  return (
-      x[:,:,:,None,:]
-      .expand(bsz,seq_len,n_kv_heads,n_rep, head_dim)
-      .reshape(bsz,seq_len,n_kv_heads * n_rep, head_dim)
-  )
+    def forward(self, x, cos, sin, layer: int, kv: "PagedKVCache", meta: "AttnMeta", backend) -> torch.Tensor:
+        N = x.shape[0]
+        q = self.q_proj(x).view(N, self.n_heads, self.head_dim)
+        k = self.k_proj(x).view(N, self.n_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(N, self.n_kv_heads, self.head_dim)
+        q, k = apply_rope(q, k, cos, sin)
+        kv.write(layer, meta.slots, k, v)
+        return self.o_proj(backend.run(q, layer, kv).reshape(N, -1))
 
 
-class FeedForward(nn.Module):
-  def __init__(self, dim:int, hidden_dim:int, multiple_of:int, ffn_dim_multiplier: Optional[float]):
-    super().__init__()
-    # Models embedding dimension
-    self.dim = dim
+class MLP(nn.Module):
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
-    # We must use the hidden dimensions calculation shared by Meta which is the ideal one for this model
-    # Hidden dimension are calculated such that it is a multiple of 256.
-    hidden_dim = int(2 * hidden_dim/3)
-    if ffn_dim_multiplier is not None:
-      hidden_dim = int(ffn_dim_multiplier * hidden_dim)
-    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-
-    # define hiddne layers weights
-    self.w1 = nn.Linear(self.dim, hidden_dim, bias=False, device=device)
-    self.w2 = nn.Linear(hidden_dim, self.dim, bias=False, device=device)
-    self.w3 = nn.Linear(self.dim, hidden_dim, bias=False, device=device)
-
-  def forward(self, x):
-    # Shape: [bsz,seq_len,dim]
-    return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class DecoderLayer(nn.Module):
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.self_attn = Attention(config)
+        self.mlp = MLP(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-class TransformerBlock(nn.Module):
-  def __init__(self, args: ModelArgs):
-    super().__init__()
-    self.args = args
-    # Initilizate RMSNorm for attention
-    self.attention_norm = RMSNorm(dim=args.dim, eps = args.norm_eps)
-    # Initilizate Attention class
-    self.attention = Attention(args)
-    # Initilizate RMSNorm for feedfoward class
-    self.ff_norm = RMSNorm(dim=args.dim, eps = args.norm_eps)
-    # Initilizate feedfoward class
-    self.feedforward = FeedForward(args.dim, 4 * args.dim, args.multiple_of, args.ffn_dim_multiplier)
-
-  def forward(self, x, start_pos, inference):
-    # start_pos = token position for inference mode, inference = True for inference and False for training mode
-    # i) pass input embedding to attention_norm and then pass to attention block.
-    # ii) the output of attention is then added to embedding(before norm)
-    h = x + self.attention(self.attention_norm(x), start_pos, inference)
-
-    # i) pass attention output to ff_norm and then pass to the feedforward network.
-    # ii) the output of feedforward network is then added to the attention output(before ff_norm)
-    out = h + self.feedforward(self.ff_norm(h))
-    # Shape: [bsz,seq_len,dim]
-    return out
+    def forward(self, x, cos, sin, layer, kv, meta, backend) -> torch.Tensor:
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, layer, kv, meta, backend)
+        return x + self.mlp(self.post_attention_layernorm(x))
 
 
-class Transformer(nn.Module):
-  def __init__(self, params: ModelArgs):
-    super().__init__()
-    # set all the ModelArgs in params variable
-    self.params = params
-    # Initilizate embedding class from the input block
-    self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+class LlamaModel(nn.Module):
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList(DecoderLayer(config) for _ in range(config.num_hidden_layers))
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.rotary_emb = RotaryEmbedding(config)
 
-    # Initialize the decoder block and store it inside the ModuleList. 
-    # This is because we've 4 decoder blocks in our Llama 3 model. (Official Llama 3 has 32 blocks)
-    self.layers = nn.ModuleList()
-    for layer_id in range(params.n_layers):
-      self.layers.append(TransformerBlock(args=params))
+    def forward(self, input_ids, kv, meta, backend, aux_layers=()) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """input_ids [N] flat over the batch. -> (normed hidden [N, hidden], residual stream entering each aux layer)"""
+        x = self.embed_tokens(input_ids)
+        cos, sin = self.rotary_emb.tables(x.device, x.dtype)
+        cos, sin = cos[meta.positions], sin[meta.positions]
 
-    # Initilizate RMSNorm for the output block
-    self.norm = RMSNorm(params.dim, eps = params.norm_eps)
-    
-    # Initilizate linear layer at the output block.
-    self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+        aux: list[torch.Tensor] = []
+        for i, layer in enumerate(self.layers):
+            if i in aux_layers:
+                aux.append(x)
+            x = layer(x, cos, sin, i, kv, meta, backend)
+        return self.norm(x), aux
 
-  def forward(self, x, start_pos=0, targets=None):
-    
-    # start_pos = token position for inference mode, inference = True for inference and False for training mode
-    # x is the batch of token_ids generated from the texts or prompts using tokenizers.
-    # x[bsz, seq_len] -> h[bsz, seq_len, dim]
-    h = self.tok_embeddings(x)
 
-    # If the target is none, Inference mode is activated and set to "True" and "False" if Training mode is activated.
-    if targets is None:
-      inference = True
-    else:
-      inference = False
+class LlamaForCausalLM(nn.Module):
+    def __init__(self, config: LlamaConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.model = LlamaModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.backend = None  # set by the loader; see model/attention.py
 
-    # The embeddings (h) will then pass though all the decoder blocks.
-    for layer in self.layers:
-      h = layer(h, start_pos, inference)
+    def tie_weights(self) -> None:
+        self.lm_head.weight = self.model.embed_tokens.weight
 
-    # The output from the final decoder block will feed into the RMSNorm
-    h = self.norm(h)
-
-    # After normalized, the embedding h will then feed into the Linear layer. 
-    # The main task of the Linear layer is to generate logits that maps the embeddings with the vocabulary size.
-    # h[bsz, seq_len, dim] -> logits[bsz, seq_len, vocab_size]
-    logits = self.output(h).float()
-    loss = None
-
-    # Inference mode is activated if the targets is not available
-    if targets is None:
-      loss = None
-    # Training mode is activated if the targets are available. And Loss will be calculated for further model training. 
-    else:
-      loss = F.cross_entropy(logits.view(-1, self.params.vocab_size), targets.view(-1))
-
-    return logits, loss
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        kv: "PagedKVCache",
+        meta: "AttnMeta",
+        aux_layers: tuple[int, ...] = (),
+        logits_idx: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """input_ids [N] at meta.positions. -> (logits [N or len(logits_idx), V], aux hidden states)"""
+        self.backend.plan(meta)
+        h, aux = self.model(input_ids, kv, meta, self.backend, aux_layers)
+        if logits_idx is not None:
+            h = h[logits_idx]
+        return self.lm_head(h), aux

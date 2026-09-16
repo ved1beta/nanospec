@@ -1,7 +1,8 @@
 """Modal entry points. One H100; the image is torch + flashinfer + transformers .
 
-    modal run modal_app.py::g1                       # Llama-3.1-8B-Instruct, 32 x 128, vs HF
-    modal run modal_app.py::g1 --model NousResearch/Meta-Llama-3.1-8B-Instruct   # ungated mirror
+    modal run modal_app.py::gates                    # G1 + G2 on Llama-3.1-8B-Instruct, 32 x 128, vs HF
+    modal run modal_app.py::gates --model NousResearch/Meta-Llama-3.1-8B-Instruct   # ungated mirror
+    modal run modal_app.py::gates --extra "-k g2"
 
 Needs a Modal secret named `huggingface` with HF_TOKEN for gated meta-llama repos.
 Weights are cached in the `nanospec-hf-cache` volume across runs.
@@ -35,12 +36,12 @@ hf_cache = modal.Volume.from_name("nanospec-hf-cache", create_if_missing=True)
     volumes={HF_CACHE: hf_cache},
     secrets=[modal.Secret.from_name("huggingface")],
 )
-def g1(model: str = "meta-llama/Llama-3.1-8B-Instruct", max_new: int = 128, extra: str = ""):
-    """Run the G1 gate on an H100 and print the pytest summary."""
+def gates(model: str = "meta-llama/Llama-3.1-8B-Instruct", max_new: int = 128, extra: str = ""):
+    """Run the correctness gates (G1, G2) on an H100."""
     env = {"NANOSPEC_MODEL": model, "NANOSPEC_DEVICE": "cuda", "NANOSPEC_MAX_NEW": str(max_new)}
-    cmd = ["python", "-m", "pytest", "tests/test_g1_correctness.py", "-q", "-x", *extra.split()]
+    cmd = ["python", "-m", "pytest", "tests/", "-q", "-x", *extra.split()]
     rc = subprocess.call(cmd, cwd=REPO, env={**os.environ, **env})
     hf_cache.commit()
     if rc != 0:
-        raise SystemExit(f"G1 failed (pytest exit {rc})")
-    print(f"G1 green: {model}, 32 prompts x {max_new} tokens")
+        raise SystemExit(f"gates failed (pytest exit {rc})")
+    print(f"gates green: {model}, 32 prompts x {max_new} tokens")
