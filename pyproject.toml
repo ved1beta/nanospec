@@ -1,0 +1,17 @@
+[project]
+name = "nanospec"
+version = "0.0.0"
+description = "inference engine with speculative decoding"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5",
+    "safetensors",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "transformers>=4.45"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
