@@ -1,4 +1,4 @@
-"""32 prompts for the correctness gates. Mixed length and register on purpose:
+"""32 prompts for the correctness tests. Mixed length and register on purpose:
 short factual, instructions, code, a little multilingual, one long-ish one."""
 
 G1_PROMPTS = [

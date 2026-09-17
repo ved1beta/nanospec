@@ -1,7 +1,7 @@
 """Llama-3 decoder.
 
 Module names and op order match HF `transformers` so weights load without remapping
-and greedy decode is bit-identical (G1). Tokens are flat [N] over the batch; the paged
+and greedy decode is bit-identical to it. Tokens are flat [N] over the batch; the paged
 cache (kv/) and attention backend (model/attention.py) are passed in per step.
 """
 

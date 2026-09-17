@@ -1,7 +1,7 @@
-"""G1 / G2: greedy decode of 32 prompts x 128 tokens matches HF transformers greedy
+"""Greedy decode of 32 prompts x 128 tokens matches HF transformers greedy
 token-for-token, and logits agree within bf16 tolerance at every position.
 
-G1 runs on a fresh pool with a large block size; G2 is the same test with block_size=16
+The "plain" case runs on a fresh pool with a large block size; "fragmented" uses block_size=16
 on a pool fragmented by alloc/free churn first.
 
 """
@@ -15,19 +15,19 @@ import torch
 
 from kv.allocator import BlockAllocator
 from kv.cache import AttnMeta, PagedKVCache
-from tests.conftest import DEVICE, DTYPE, MAX_NEW_TOKENS, logit_tol
+from tests.conftest import DEVICE, DTYPE, MAX_NEW_TOKENS, assert_logits_close, assert_tokens_match
 from tests.decode import greedy
 from tests.prompts import G1_PROMPTS
 
 MAX_SEQ = 1024
 
-# gate -> (block_size, fragment the pool first)
-GATES = {"g1": (256, False), "g2": (16, True)}
+# case -> (block_size, fragment the pool first)
+CASES = {"plain": (256, False), "fragmented": (16, True)}
 
 
-@pytest.fixture(scope="module", params=list(GATES), ids=list(GATES))
+@pytest.fixture(scope="module", params=list(CASES), ids=list(CASES))
 def paged(request, ns):
-    block_size, fragment = GATES[request.param]
+    block_size, fragment = CASES[request.param]
     # enough for 4 max-length requests plus churn headroom
     num_blocks = 4 * -(-MAX_SEQ // block_size) + 64
     kv = PagedKVCache(ns.config, num_blocks, block_size, DEVICE, DTYPE)
@@ -50,33 +50,22 @@ def paged(request, ns):
     return kv, alloc
 
 
-def _assert_logits_close(ours: torch.Tensor, ref: torch.Tensor, where: str) -> None:
-    ours, ref = ours.float(), ref.float()
-    diff = (ours - ref).abs()
-    bad = diff > logit_tol(ref)
-    if bad.any():
-        pos = tuple(bad.nonzero()[0].tolist())
-        raise AssertionError(
-            f"{where}: {int(bad.sum())} logits outside bf16 tolerance; worst |diff|={diff.max().item():.4f}, "
-            f"first at {pos}: ours={ours[pos].item():.4f} ref={ref[pos].item():.4f}"
-        )
-
-
 @pytest.mark.parametrize("i", range(len(G1_PROMPTS)), ids=lambda i: f"p{i:02d}")
-def test_greedy_matches_hf(ns, paged, encoded, hf_ref, i):
+def test_greedy_matches_hf(ns, strict, paged, encoded, hf_ref, i):
     kv, alloc = paged
     ref_tokens, ref_logits = hf_ref[i]
     our_tokens, our_logits = greedy(ns, kv, alloc, i, encoded[i], MAX_NEW_TOKENS)
     alloc.check()
 
-    if our_tokens != ref_tokens:
-        k = next((k for k, (a, b) in enumerate(zip(our_tokens, ref_tokens)) if a != b), min(len(our_tokens), len(ref_tokens)))
-        raise AssertionError(f"prompt {i}: diverged at step {k}\nours={our_tokens}\nref ={ref_tokens}")
-    _assert_logits_close(our_logits, ref_logits, f"prompt {i} decode-step logits")
+    tie = assert_tokens_match(our_tokens, ref_tokens, ref_logits, strict, f"prompt {i}")
+    n = tie[0] if tie else min(len(our_logits), len(ref_logits))
+    assert_logits_close(our_logits[:n], ref_logits[:n], f"prompt {i} decode-step logits", strict)
+    if tie:
+        print(f"\n[correctness] prompt {i}: diverged from HF at step {tie[0]} on a bf16 tie (gap {tie[1]:.4f})")
 
 
 @pytest.mark.parametrize("i", range(len(G1_PROMPTS)), ids=lambda i: f"p{i:02d}")
-def test_prefill_logits_every_position(hf, ns, paged, encoded, hf_ref, i):
+def test_prefill_logits_every_position(hf, ns, strict, paged, encoded, hf_ref, i):
     """Teacher-forced forward over prompt + HF's continuation: logits at every position."""
     _, hf_model = hf
     kv, alloc = paged
@@ -88,4 +77,4 @@ def test_prefill_logits_every_position(hf, ns, paged, encoded, hf_ref, i):
     meta = AttnMeta.build([table], [full.shape[0]], kv.block_size, DEVICE)
     ours, _ = ns(full, kv, meta)
     alloc.free(1000 + i)
-    _assert_logits_close(ours, ref, f"prompt {i} prefill logits")
+    assert_logits_close(ours, ref, f"prompt {i} prefill logits", strict)

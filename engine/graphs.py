@@ -63,6 +63,7 @@ class GraphRunner:
 
         self.inputs = torch.zeros(3, max_rows, dtype=torch.int64, device=device)  # ids, positions, slots
         self.input_ids, self.positions, self.slots = self.inputs[0], self.inputs[1], self.inputs[2]
+        self.stage = torch.zeros(3, max_rows, dtype=torch.int64).pin_memory()  # host staging, allocated once
         self.hidden = torch.zeros(max_rows, hidden_dim, dtype=dtype, device=device) if hidden_dim else None
         self.kv_indices = torch.zeros(kv.num_blocks + max_bs, dtype=torch.int32, device=device)
         self.workspace = torch.empty(128 << 20, dtype=torch.uint8, device=device)
@@ -128,11 +129,8 @@ class GraphRunner:
             masks = list(meta.masks) if meta.masks is not None else [None] * B
             masks = [m if m is not None else AttnMeta.causal_mask(R, k, self.device) for m, k in zip(masks, meta.seq_lens)]
             masks += [torch.ones(R, 1, dtype=torch.bool, device=self.device)] * n_pad
-        pad_meta = AttnMeta(
-            qo_indptr=torch.arange(0, (bs + 1) * R, R, dtype=torch.int32, device=self.device),
-            kv_indptr=i32(indptr).to(self.device),
-            kv_indices=i32(indices).to(self.device),
-            kv_last_page_len=i32(last).to(self.device),
+        pad_meta = AttnMeta(  # only positions / slots are read inside the graph
+            qo_indptr=None, kv_indptr=None, kv_indices=None, kv_last_page_len=None,
             positions=self.positions[: bs * R],
             slots=self.slots[: bs * R],
             seq_lens=list(meta.seq_lens) + [1] * n_pad,
@@ -143,7 +141,7 @@ class GraphRunner:
         w = self.wrappers[bs]
         if self.masked:
             w.plan(i32(list(range(0, (bs + 1) * R, R))), i32(indptr), i32(indices), i32(last),
-                   head_dim_qk=self.head_dim, custom_mask=pad_meta.custom_mask, **self.plan_kwargs)
+                   head_dim_qk=self.head_dim, custom_mask=pad_meta.flat_mask(self.device), **self.plan_kwargs)
         elif R == 1:
             w.plan(i32(indptr), i32(indices), i32(last), head_dim=self.head_dim, **self.plan_kwargs)
         else:
@@ -151,17 +149,18 @@ class GraphRunner:
                    head_dim_qk=self.head_dim, causal=True, **self.plan_kwargs)
 
         pad_slot = self.pad_block * self.kv.block_size
+        n = bs * R
+        stage = self.stage[:, :n]
+        stage[1] = torch.tensor(meta.positions_host + [0] * (n_pad * R))
+        stage[2] = torch.tensor(meta.slots_host + [pad_slot] * (n_pad * R))
         if torch.is_tensor(ids):  # already on device (draft tokens): copy, pad rows keep zeros
             self.input_ids[: B * R].copy_(ids)
-            self.input_ids[B * R : bs * R].zero_()
-            host = torch.tensor([meta.positions_host + [0] * (n_pad * R), meta.slots_host + [pad_slot] * (n_pad * R)],
-                                dtype=torch.int64).pin_memory()
-            self.inputs[1:, : bs * R].copy_(host, non_blocking=True)
+            self.input_ids[B * R : n].zero_()
+            self.inputs[1:, :n].copy_(stage[1:], non_blocking=True)
         else:
-            host = torch.tensor([list(ids) + [0] * (n_pad * R), meta.positions_host + [0] * (n_pad * R),
-                                 meta.slots_host + [pad_slot] * (n_pad * R)], dtype=torch.int64).pin_memory()
-            self.inputs[:, : bs * R].copy_(host, non_blocking=True)
-        if hidden is not None:
+            stage[0] = torch.tensor(list(ids) + [0] * (n_pad * R))
+            self.inputs[:, :n].copy_(stage, non_blocking=True)
+        if hidden is not None and hidden.data_ptr() != self.hidden.data_ptr():
             self.hidden[: B * R].copy_(hidden)
         return pad_meta
 

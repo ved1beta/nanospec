@@ -28,6 +28,7 @@ class EngineConfig:
     spec_depth: int = 0  # EAGLE-3 draft depth; 0 = no speculation
     spec_topk: int = 1  # 1 = chain; >1 = static tree of topk * depth nodes (PLAN D5)
     record_logits: bool = False  # keep each request's per-step next-token logits on CPU (tests)
+    profile: bool = False  # per-phase CUDA-event timings in Engine.prof (tests / bench)
 
     @property
     def num_draft(self) -> int:
@@ -54,10 +55,26 @@ class Engine:
             assert drafter is not None, "spec_depth > 0 needs an EAGLE-3 drafter"
             self.draft_kv = PagedKVCache(drafter.config.rope_config(), config.num_blocks, config.block_size, self.device, self.dtype)
 
-        self.graphs = self.verify_graphs = self.draft_graphs = None
+        self.graphs = self.verify_graphs = self.draft_graphs = self.extend_graphs = None
         self.usable_blocks = config.num_blocks  # minus the graph pad block, if any
         if config.cuda_graphs and self.device.type == "cuda":
             self._capture_graphs()
+        self.prof: dict[str, list[float]] = {}
+        self._events: list[tuple[str, torch.cuda.Event]] = []
+
+    def _mark(self, name: str) -> None:
+        if self.config.profile:
+            e = torch.cuda.Event(enable_timing=True)
+            e.record()
+            self._events.append((name, e))
+
+    def _flush_prof(self) -> None:
+        if not self._events:
+            return
+        torch.cuda.synchronize()
+        for (a, ea), (b, eb) in zip(self._events, self._events[1:]):
+            self.prof.setdefault(b, []).append(ea.elapsed_time(eb))
+        self._events.clear()
 
     def _capture_graphs(self) -> None:
         from engine.graphs import GraphRunner
@@ -83,6 +100,11 @@ class Engine:
         self.draft_graphs = GraphRunner(self.draft_kv, pad_block, self.topk, self.topk > 1, *dheads,
                                         hidden_dim=d.hidden_size, buckets=(1, 2, 4, 8, 16, 32))
         self.draft_graphs.capture(lambda ids, h, meta, be: self.drafter(ids, h, self.draft_kv, meta, backend=be))
+        # the extend has a+1 <= depth+1 rows: pad to depth+1 with a causal mask; pad rows
+        # write K/V into the tree region, which the draft levels overwrite and mask out
+        self.extend_graphs = GraphRunner(self.draft_kv, pad_block, self.depth + 1, True, *dheads,
+                                         hidden_dim=d.num_tapped * d.hidden_size, buckets=(1, 2, 4, 8, 16, 32))
+        self.extend_graphs.capture(lambda ids, h, meta, be: self.drafter(ids, h, self.draft_kv, meta, backend=be))
 
     # ------------------------------------------------------------------ requests
 
@@ -164,8 +186,10 @@ class Engine:
             n_new.append(len(req.prompt_ids))
             starts.append(0)
             self.alloc.append(req.id, D + 1)
-        meta = AttnMeta.build([r.table for r in batch], n_new, self.config.block_size, self.device, starts)
+        self._mark("start")
+        meta = AttnMeta.build([r.table for r in batch], n_new, self.config.block_size, None, starts)
         logits, aux = self._verify_forward(ids, meta)
+        self._mark("verify")
         argmax = logits.argmax(-1).tolist()
 
         finished, alive = [], []
@@ -196,21 +220,67 @@ class Engine:
             req.ext_ids, req.ext_hidden = ext_ids, ext_hidden
             alive.append(req)
 
+        self._mark("accept")
         if alive:
             self._draft(alive)
+        self._flush_prof()
         return finished
 
     def _verify_forward(self, ids: list[int], meta: AttnMeta) -> tuple[torch.Tensor, torch.Tensor]:
         """Target forward with aux taps: captured graph when the batch is pure verify."""
         if self.verify_graphs is not None and self.verify_graphs.can_run(meta):
             return self.verify_graphs.run(meta, ids)
+        meta = self._materialize(meta)
         input_ids = torch.tensor(ids, dtype=torch.int64, device=self.device)
         logits, aux = self.model(input_ids, self.kv, meta, aux_layers=self.taps)
         return logits, torch.cat(aux, dim=-1)
 
+    def _materialize(self, meta: AttnMeta) -> AttnMeta:
+        """Host-only meta (built for a graph runner) -> device tensors for an eager forward."""
+        if meta.qo_indptr is not None:
+            return meta
+        d = self.device
+        i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=d)
+        i64 = lambda x: torch.tensor(x, dtype=torch.int64, device=d)
+        import dataclasses
+
+        return dataclasses.replace(
+            meta,
+            qo_indptr=i32([0] + list(torch.tensor(meta.qo_lens).cumsum(0).tolist())),
+            kv_indptr=i32(meta.kv_indptr_host), kv_indices=i32(meta.kv_indices_host),
+            kv_last_page_len=i32(meta.kv_last_page_len_host),
+            positions=i64(meta.positions_host), slots=i64(meta.slots_host),
+        )
+
+    def _extend(self, reqs: list[Request]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draft extend over each request's newly committed tokens. -> (logits, h) at the
+        last real row of each request. Captured when every request fits depth+1 rows."""
+        bs = self.config.block_size
+        tables = [r.table for r in reqs]
+        n = [len(r.ext_ids) for r in reqs]
+        starts = [r.committed - k for r, k in zip(reqs, n)]
+        Re = self.depth + 1
+        g = self.extend_graphs
+        if g is not None and max(n) <= Re and g.bucket(len(reqs)) is not None:
+            rows = [(list(range(st, st + Re)), list(range(st, st + Re)), st + Re) for st in starts]
+            meta = AttnMeta.from_rows(tables, rows, bs, None)
+            ids = [t for r, k in zip(reqs, n) for t in r.ext_ids + [0] * (Re - k)]
+            for b, r in enumerate(reqs):  # straight into the runner's static hidden buffer
+                g.hidden[b * Re : b * Re + n[b]].copy_(r.ext_hidden)
+            logits, h = g.run(meta, ids, g.hidden)
+            last = torch.tensor([b * Re + k - 1 for b, k in enumerate(n)], device=self.device)
+            return logits[last], h[last]
+        ids = torch.tensor([t for r in reqs for t in r.ext_ids], dtype=torch.int64, device=self.device)
+        hidden = torch.cat([r.ext_hidden for r in reqs])
+        meta = AttnMeta.build(tables, n, bs, self.device, starts)
+        logits, h = self.drafter(ids, hidden, self.draft_kv, meta)
+        last = meta.last_token_idx
+        return logits[last], h[last]
+
     def _draft_forward(self, ids, hidden: torch.Tensor, meta: AttnMeta) -> tuple[torch.Tensor, torch.Tensor]:
         if self.draft_graphs is not None and self.draft_graphs.can_run(meta):
             return self.draft_graphs.run(meta, ids, hidden)
+        meta = self._materialize(meta)
         if not torch.is_tensor(ids):
             ids = torch.tensor(ids, dtype=torch.int64, device=self.device)
         return self.drafter(ids, hidden, self.draft_kv, meta)
@@ -219,28 +289,24 @@ class Engine:
         """Extend the draft cache over the newly committed tokens, then chain D-1 steps."""
         D = self.depth
         tables = [r.table for r in reqs]
-        n = [len(r.ext_ids) for r in reqs]
-        starts = [r.committed - len(r.ext_ids) for r in reqs]
-        ids = torch.tensor([t for r in reqs for t in r.ext_ids], dtype=torch.int64, device=self.device)
-        hidden = torch.cat([r.ext_hidden for r in reqs])
-        meta = AttnMeta.build(tables, n, self.config.block_size, self.device, starts)
-        logits, h = self.drafter(ids, hidden, self.draft_kv, meta)
-        last = meta.last_token_idx
-        tok = self.drafter.to_target_ids(logits[last].argmax(-1))
-        h = h[last]
+        dev = None if self.draft_graphs is not None else self.device
+        logits, h = self._extend(reqs)
+        self._mark("extend")
+        tok = self.drafter.to_target_ids(logits.argmax(-1))
         drafts = [tok]
         for j in range(1, D):
             starts = [r.committed + j - 1 for r in reqs]
-            meta = AttnMeta.build(tables, [1] * len(reqs), self.config.block_size, self.device, starts)
+            meta = AttnMeta.build(tables, [1] * len(reqs), self.config.block_size, dev, starts)
             logits, h = self._draft_forward(tok, h, meta)
             tok = self.drafter.to_target_ids(logits.argmax(-1))
             drafts.append(tok)
         drafts = torch.stack(drafts, dim=1).tolist()  # [B, D]
+        self._mark("levels")
         for r, d in zip(reqs, drafts):
             r.drafts = d
             r.ext_ids, r.ext_hidden = [], None
 
-    # ------------------------------------------------------------------ tree speculation (G6)
+    # ------------------------------------------------------------------ tree speculation
 
     def _tree_step(self, running: list[Request], new: list[Request]) -> list[Request]:
         N = self.config.num_draft
@@ -259,8 +325,10 @@ class Engine:
             rows.append((list(range(n)), list(range(n)), n))
             masks.append(None)
             self.alloc.append(req.id, N + 1)
-        meta = AttnMeta.from_rows([r.table for r in batch], rows, bs, self.device, masks)
+        self._mark("start")
+        meta = AttnMeta.from_rows([r.table for r in batch], rows, bs, None, masks)
         logits, aux = self._verify_forward(ids, meta)
+        self._mark("verify")
         argmax = logits.argmax(-1).tolist()
 
         finished, alive = [], []
@@ -298,8 +366,10 @@ class Engine:
             req.ext_ids, req.ext_hidden = ext_ids, ext_hidden
             alive.append(req)
 
+        self._mark("accept")
         if alive:
             self._draft_tree(alive)
+        self._flush_prof()
         return finished
 
     def _draft_tree(self, reqs: list[Request]) -> None:
@@ -309,27 +379,23 @@ class Engine:
         K, D, N, bs = self.topk, self.depth, self.config.num_draft, self.config.block_size
         B = len(reqs)
         tables = [r.table for r in reqs]
-        n = [len(r.ext_ids) for r in reqs]
-        starts = [r.committed - len(r.ext_ids) for r in reqs]
-        ids = torch.tensor([t for r in reqs for t in r.ext_ids], dtype=torch.int64, device=self.device)
-        hidden = torch.cat([r.ext_hidden for r in reqs])
-        meta = AttnMeta.build(tables, n, bs, self.device, starts)
-        logits, h = self.drafter(ids, hidden, self.draft_kv, meta)
-        last = meta.last_token_idx
-        top = torch.log_softmax(logits[last].float(), dim=-1).topk(K, dim=-1)
+        dev = None if self.draft_graphs is not None else self.device
+        logits, h_last = self._extend(reqs)
+        self._mark("extend")
+        top = torch.log_softmax(logits.float(), dim=-1).topk(K, dim=-1)
 
         tok_dev = self.drafter.to_target_ids(top.indices)  # [B, K] level-1 tokens (target ids)
         tokens = tok_dev.tolist()  # per request, depth-major node lists
         parents = [[-1] * K for _ in range(B)]
         depths = [[1] * K for _ in range(B)]
         scores = top.values  # [B, K] cumulative log-prob of the current level's nodes
-        h_parent = h[last][:, None, :].expand(B, K, -1)  # hidden feeding each current node
+        h_parent = h_last[:, None, :].expand(B, K, -1)  # hidden feeding each current node
 
         for d in range(1, D):
             level = list(range((d - 1) * K, d * K))  # node indices of the current level
             rows = [([r.committed + d - 1] * K, [r.committed + i for i in level], r.committed + N) for r in reqs]
             masks = [draft_mask(r.committed, parents[b], level, N, self.device) for b, r in enumerate(reqs)]
-            meta = AttnMeta.from_rows(tables, rows, bs, self.device, masks)
+            meta = AttnMeta.from_rows(tables, rows, bs, dev, masks)
             logits, h = self._draft_forward(tok_dev.reshape(-1), h_parent.reshape(B * K, -1), meta)
             child = torch.log_softmax(logits.float(), dim=-1).view(B, K, -1).topk(K, dim=-1)  # [B, K, K]
             cand_scores = (scores[:, :, None] + child.values).reshape(B, K * K)
@@ -344,6 +410,7 @@ class Engine:
                 parents[b] += [level[p] for p in new_parents[b]]
                 depths[b] += [d + 1] * K
 
+        self._mark("levels")
         for b, r in enumerate(reqs):
             r.tree = Tree(tokens[b], parents[b], depths[b])
             r.ext_ids, r.ext_hidden = [], None

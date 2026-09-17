@@ -1,7 +1,7 @@
 """Modal entry points. One H100; the image is torch + flashinfer + transformers .
 
-    modal run modal_app.py::gates                    # G1-G3 on Llama-3.1-8B-Instruct, 32 x 128, vs HF
-    modal run modal_app.py::gates --extra "-k g2"
+    modal run modal_app.py::test                    # full suite on Llama-3.1-8B-Instruct, 32 x 128, vs HF
+    modal run modal_app.py::test --extra "-k fragmented"
 
 Default model is the ungated mirror of Llama-3.1-8B-Instruct (identical weights). For the
 gated meta-llama repo, export HF_TOKEN locally; it is passed through to the container.
@@ -37,22 +37,22 @@ hf_cache = modal.Volume.from_name("nanospec-hf-cache", create_if_missing=True)
     volumes={HF_CACHE: hf_cache},
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
-def gates(
+def test(
     model: str = "NousResearch/Meta-Llama-3.1-8B-Instruct",
     eagle: str = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
     max_new: int = 128,
     extra: str = "",
     backend: str = "auto",
 ):
-    """Run the correctness gates on an H100. backend=sdpa is the strict bit-exact oracle."""
+    """Run the test suite on an H100. backend=sdpa is the strict bit-exact oracle."""
     env = {"NANOSPEC_MODEL": model, "NANOSPEC_EAGLE": eagle, "NANOSPEC_DEVICE": "cuda",
            "NANOSPEC_MAX_NEW": str(max_new), "NANOSPEC_BACKEND": backend}
     cmd = ["python", "-m", "pytest", "tests/", "-q", "-s", "-p", "no:warnings", *shlex.split(extra)]
     rc = subprocess.call(cmd, cwd=REPO, env={**os.environ, **env})
     hf_cache.commit()
     if rc != 0:
-        raise SystemExit(f"gates failed (pytest exit {rc})")
-    print(f"gates green: {model}, 32 prompts x {max_new} tokens")
+        raise SystemExit(f"tests failed (pytest exit {rc})")
+    print(f"tests green: {model}, 32 prompts x {max_new} tokens")
 
 
 @app.function(gpu="H100", timeout=30 * 60, volumes={HF_CACHE: hf_cache},

@@ -66,18 +66,20 @@ class AttnMeta:
         qi = torch.arange(k - q, k, device=device)[:, None]
         return torch.arange(k, device=device)[None, :] <= qi
 
-    @property
-    def custom_mask(self) -> torch.Tensor | None:
+    def flat_mask(self, device) -> torch.Tensor | None:
         """All requests' masks flattened (FlashInfer's custom_mask), causal ones made
         explicit. None when no request has a mask, so eager callers can use the plain
         causal kernels; graph runners must materialise masks themselves."""
         if self.masks is None or all(m is None for m in self.masks):
             return None
-        dev = self.qo_indptr.device
         return torch.cat([
-            (m if m is not None else self.causal_mask(q, k, dev)).reshape(-1)
+            (m if m is not None else self.causal_mask(q, k, device)).reshape(-1)
             for m, q, k in zip(self.masks, self.qo_lens, self.seq_lens)
         ])
+
+    @property
+    def custom_mask(self) -> torch.Tensor | None:
+        return self.flat_mask(self.qo_indptr.device)
 
     @property
     def is_decode(self) -> bool:
@@ -124,8 +126,9 @@ class AttnMeta:
             positions.extend(qpos)
             slots.extend(t.blocks[p // block_size] * block_size + p % block_size for p in qslot)
         n_new = [len(r[0]) for r in rows]
-        i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=device)
-        i64 = lambda x: torch.tensor(x, dtype=torch.int64, device=device)
+        # device=None: host lists only (the graph runners copy into their own static buffers)
+        i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=device) if device is not None else None
+        i64 = lambda x: torch.tensor(x, dtype=torch.int64, device=device) if device is not None else None
         return cls(
             qo_indptr=i32(qo_indptr),
             kv_indptr=i32(kv_indptr),

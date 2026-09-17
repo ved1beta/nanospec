@@ -21,7 +21,7 @@ from model.loader import load_eagle3, load_model
 from sched.scheduler import SamplingParams
 from tests.conftest import DEVICE, DTYPE, MODEL
 from tests.prompts import G1_PROMPTS
-from tests.test_g5_spec_chain import DEPTH, SelfDrafter
+from tests.test_spec_chain import DEPTH, SelfDrafter
 
 EAGLE = os.environ.get("NANOSPEC_EAGLE") or "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 NB, BS = 1024, 16
