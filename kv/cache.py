@@ -61,7 +61,7 @@ class AttnMeta:
     masks: list[torch.Tensor | None] = None  # per request bool [qo, kv]; None = causal
 
     @staticmethod
-    def causal_mask(q: int, k: int, device) -> torch.Tensor:
+    def causal_mask(q: int, k: int, device=None) -> torch.Tensor:
         """[q, k] bool, bottom-right aligned: the last query row sees every key."""
         qi = torch.arange(k - q, k, device=device)[:, None]
         return torch.arange(k, device=device)[None, :] <= qi

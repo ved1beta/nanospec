@@ -49,7 +49,7 @@ def verify_mask(prefix_len: int, parents: list[int], device) -> torch.Tensor:
     m = torch.zeros(1 + n, prefix_len + 1 + n, dtype=torch.bool)
     m[:, : prefix_len + 1] = True  # everyone sees the prefix and the root
     m[1:, prefix_len + 1 :] = ancestor_matrix(parents)
-    return m.to(device, non_blocking=True)
+    return m.to(device, non_blocking=True) if device is not None else m
 
 
 def draft_mask(prefix_len: int, parents: list[int], rows: list[int], n_slots: int, device) -> torch.Tensor:
@@ -59,7 +59,7 @@ def draft_mask(prefix_len: int, parents: list[int], rows: list[int], n_slots: in
     m = torch.zeros(len(rows), prefix_len + n_slots, dtype=torch.bool)
     m[:, :prefix_len] = True
     m[:, prefix_len : prefix_len + a.shape[0]] = a[rows]
-    return m.to(device, non_blocking=True)
+    return m.to(device, non_blocking=True) if device is not None else m
 
 
 def longest_accepted(tree: Tree, argmax: list[int]) -> tuple[list[int], int]:

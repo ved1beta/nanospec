@@ -206,3 +206,4 @@ class GraphRunner:
         self._load(meta, ids, bs, hidden)
         self.graphs[bs].replay()
         return tuple(o[: B * self.R] for o in self.outputs[bs])
+
