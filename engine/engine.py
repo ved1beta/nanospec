@@ -16,7 +16,7 @@ from kv.allocator import BlockAllocator
 from kv.cache import AttnMeta, PagedKVCache
 from model.llama import LlamaForCausalLM, eagle3_aux_layers
 from sched.scheduler import Request, SamplingParams, Scheduler
-from spec.tree import Tree, draft_mask, longest_accepted, select_children, verify_mask
+from spec.tree import Tree, draft_mask, longest_accepted, verify_mask
 
 
 @dataclass(frozen=True)
@@ -303,7 +303,9 @@ class Engine:
         return finished
 
     def _draft_tree(self, reqs: list[Request]) -> None:
-        """Extend the draft cache over the committed tokens, then grow topk nodes per level."""
+        """Extend the draft cache over the committed tokens, then grow topk nodes per level.
+        Level selection is batched on the GPU: one topk over the K*K candidates per request
+        and one host sync per level."""
         K, D, N, bs = self.topk, self.depth, self.config.num_draft, self.config.block_size
         B = len(reqs)
         tables = [r.table for r in reqs]
@@ -314,41 +316,33 @@ class Engine:
         meta = AttnMeta.build(tables, n, bs, self.device, starts)
         logits, h = self.drafter(ids, hidden, self.draft_kv, meta)
         last = meta.last_token_idx
-        logp = torch.log_softmax(logits[last].float(), dim=-1)  # [B, Vd]
-        top = logp.topk(K, dim=-1)
+        top = torch.log_softmax(logits[last].float(), dim=-1).topk(K, dim=-1)
 
-        tokens = [[] for _ in range(B)]  # per request, depth-major node lists
-        parents = [[] for _ in range(B)]
-        depths = [[] for _ in range(B)]
-        for b in range(B):
-            tokens[b] = self.drafter.to_target_ids(top.indices[b]).tolist()
-            parents[b] = [-1] * K
-            depths[b] = [1] * K
+        tok_dev = self.drafter.to_target_ids(top.indices)  # [B, K] level-1 tokens (target ids)
+        tokens = tok_dev.tolist()  # per request, depth-major node lists
+        parents = [[-1] * K for _ in range(B)]
+        depths = [[1] * K for _ in range(B)]
         scores = top.values  # [B, K] cumulative log-prob of the current level's nodes
         h_parent = h[last][:, None, :].expand(B, K, -1)  # hidden feeding each current node
 
         for d in range(1, D):
             level = list(range((d - 1) * K, d * K))  # node indices of the current level
-            ids = torch.tensor([tokens[b][i] for b in range(B) for i in level], dtype=torch.int64, device=self.device)
             rows = [([r.committed + d - 1] * K, [r.committed + i for i in level], r.committed + N) for r in reqs]
             masks = [draft_mask(r.committed, parents[b], level, N, self.device) for b, r in enumerate(reqs)]
             meta = AttnMeta.from_rows(tables, rows, bs, self.device, masks)
-            logits, h = self._draft_forward(ids, h_parent.reshape(B * K, -1), meta)
-            logp = torch.log_softmax(logits.float(), dim=-1).view(B, K, -1)
-            child = logp.topk(K, dim=-1)  # [B, K, K]
+            logits, h = self._draft_forward(tok_dev.reshape(-1), h_parent.reshape(B * K, -1), meta)
+            child = torch.log_softmax(logits.float(), dim=-1).view(B, K, -1).topk(K, dim=-1)  # [B, K, K]
             cand_scores = (scores[:, :, None] + child.values).reshape(B, K * K)
-            cand_tokens = child.indices.reshape(B, K * K)
-            cand_parents = [level[j // K] for j in range(K * K)]
-            new_scores, new_h = [], []
+            best = cand_scores.topk(K, dim=-1).indices  # [B, K] global top-k children per request
+            parent_local = best // K  # which current-level node each kept child hangs off
+            tok_dev = self.drafter.to_target_ids(child.indices.reshape(B, K * K).gather(1, best))
+            scores = cand_scores.gather(1, best)
+            h_parent = h.view(B, K, -1).gather(1, parent_local[:, :, None].expand(B, K, h.shape[-1]))
+            new_tokens, new_parents = torch.stack([tok_dev, parent_local]).tolist()  # one sync per level
             for b in range(B):
-                toks, pars, sc = select_children(cand_scores[b], cand_tokens[b], cand_parents, K)
-                tokens[b] += self.drafter.to_target_ids(torch.tensor(toks, device=self.device)).tolist()
-                parents[b] += pars
+                tokens[b] += new_tokens[b]
+                parents[b] += [level[p] for p in new_parents[b]]
                 depths[b] += [d + 1] * K
-                new_scores.append(sc)
-                new_h.append(h.view(B, K, -1)[b, [p - level[0] for p in pars]])
-            scores = torch.stack(new_scores)
-            h_parent = torch.stack(new_h)
 
         for b, r in enumerate(reqs):
             r.tree = Tree(tokens[b], parents[b], depths[b])

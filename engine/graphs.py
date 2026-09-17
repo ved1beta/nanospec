@@ -69,11 +69,10 @@ class GraphRunner:
 
         self.wrappers = {}
         for bs in self.buckets:
-            common = dict(
-                paged_kv_indptr_buf=torch.zeros(bs + 1, dtype=torch.int32, device=device),
-                paged_kv_indices_buf=self.kv_indices,
-                paged_kv_last_page_len_buf=torch.zeros(bs, dtype=torch.int32, device=device),
-            )
+            indptr_buf = torch.zeros(bs + 1, dtype=torch.int32, device=device)
+            last_buf = torch.zeros(bs, dtype=torch.int32, device=device)
+            # the two wrappers spell their buffer kwargs differently (_buf vs _buffer)
+            common = dict(paged_kv_indptr_buf=indptr_buf, paged_kv_indices_buf=self.kv_indices, paged_kv_last_page_len_buf=last_buf)
             if masked:  # custom masks are FA2-only
                 w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                     self.workspace, "NHD", backend="fa2", use_cuda_graph=True,
@@ -85,7 +84,9 @@ class GraphRunner:
             elif self.R == 1:
                 w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace, "NHD", use_cuda_graph=True,
-                    use_tensor_cores=num_heads // num_kv_heads >= 4, **common,
+                    use_tensor_cores=num_heads // num_kv_heads >= 4,
+                    paged_kv_indptr_buffer=indptr_buf, paged_kv_indices_buffer=self.kv_indices,
+                    paged_kv_last_page_len_buffer=last_buf,
                 )
             else:
                 w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(

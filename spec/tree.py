@@ -32,33 +32,34 @@ class Tree:
         return path[::-1]
 
 
-def ancestor_matrix(parents: list[int], device) -> torch.Tensor:
-    """[N, N] bool: A[i, j] = j is an ancestor-or-self of i."""
+def ancestor_matrix(parents: list[int], device=None) -> torch.Tensor:
+    """[N, N] bool: A[i, j] = j is an ancestor-or-self of i. Built on the CPU (N <= 32,
+    a Python loop beats N tiny GPU kernels) and moved once if a device is given."""
     n = len(parents)
-    a = torch.eye(n, dtype=torch.bool, device=device)
+    a = torch.eye(n, dtype=torch.bool)
     for i, p in enumerate(parents):
         if p >= 0:
             a[i] |= a[p]  # parents precede children, so a[p] is complete
-    return a
+    return a.to(device) if device is not None else a
 
 
 def verify_mask(prefix_len: int, parents: list[int], device) -> torch.Tensor:
     """[1+N, prefix_len+1+N] bool for rows [root] + nodes over kv = prefix + root + nodes."""
     n = len(parents)
-    m = torch.zeros(1 + n, prefix_len + 1 + n, dtype=torch.bool, device=device)
+    m = torch.zeros(1 + n, prefix_len + 1 + n, dtype=torch.bool)
     m[:, : prefix_len + 1] = True  # everyone sees the prefix and the root
-    m[1:, prefix_len + 1 :] = ancestor_matrix(parents, device)
-    return m
+    m[1:, prefix_len + 1 :] = ancestor_matrix(parents)
+    return m.to(device, non_blocking=True)
 
 
 def draft_mask(prefix_len: int, parents: list[int], rows: list[int], n_slots: int, device) -> torch.Tensor:
     """[len(rows), prefix_len+n_slots] bool for draft rows = nodes `rows` (as inputs) over
     kv = draft prefix + the tree's slot region: prefix + ancestors-or-self."""
-    a = ancestor_matrix(parents, device)
-    m = torch.zeros(len(rows), prefix_len + n_slots, dtype=torch.bool, device=device)
+    a = ancestor_matrix(parents)
+    m = torch.zeros(len(rows), prefix_len + n_slots, dtype=torch.bool)
     m[:, :prefix_len] = True
     m[:, prefix_len : prefix_len + a.shape[0]] = a[rows]
-    return m
+    return m.to(device, non_blocking=True)
 
 
 def longest_accepted(tree: Tree, argmax: list[int]) -> tuple[list[int], int]:
