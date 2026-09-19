@@ -2,7 +2,8 @@
 
 {"step", "req", "pos" (output tokens before this step), "depth", "topk", "accepted",
  "nodes": [{"tok", "parent", "p", "q", "u", "d"}...]   # p: target prob at the parent row,
- "final": "bonus" | "resample", "ms": {phase: ms}}     # q: draft log-prob, d: accept|reject|-
+ "final": "bonus" | "resample", "ms": {phase: ms},     # q: draft log-prob, d: accept|reject|-
+ "emitted": [{"tok", "src", "lp", "mu"}...]}           # lp: target log-prob (sampling dist), mu: behavior log-prob
 """
 
 from __future__ import annotations

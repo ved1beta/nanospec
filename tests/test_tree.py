@@ -32,7 +32,7 @@ def _greedy_walk(t, argmax):
     """Greedy acceptance through walk: p is 1 iff the node's token is the argmax at its
     parent row; the bonus is the argmax at the last accepted node's row."""
     p = [float(argmax[1 + t.parents[i]] == t.tokens[i]) for i in range(t.n)]
-    path, _ = walk(t.children(), p, [1.0] * t.n, [0.5] * t.n, None, None)
+    path, _, _ = walk(t.children(), p, [1.0] * t.n, [0.5] * t.n, None, None)
     return path, argmax[1 + path[-1] if path else 0]
 
 

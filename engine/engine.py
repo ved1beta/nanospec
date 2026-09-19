@@ -23,7 +23,7 @@ from kv.allocator import BlockAllocator
 from kv.cache import AttnMeta, PagedKVCache
 from model.llama import LlamaForCausalLM, eagle3_aux_layers
 from sched.scheduler import Request, SamplingParams, Scheduler, TokenInfo
-from spec.sampling import draw, process, walk
+from spec.sampling import behavior_logprob, draw, process, walk
 from spec.tree import Tree, ancestors, flat_masks
 
 
@@ -316,24 +316,28 @@ class Engine:
             t, f, L = req.tree, first[b], req.committed
             if t is None:  # plain decode / prefill: the last row's draw
                 j, a, path = f, 0, []
-                infos = [TokenInfo(tok[j], lpr[j], lpp[j], None, "bonus")]
+                infos = [TokenInfo(tok[j], lpr[j], lpp[j], None, "bonus", lpp[j])]
             else:
                 ch = t.children()
+                exact = p.acceptance == "exact"
                 relaxed = (p.tau, p.accept_topk) if p.acceptance == "relaxed" else None
-                path, dec = walk(ch, pn[m : m + t.n], nq[m : m + t.n], u_node[m : m + t.n],
-                                 rank[m : m + t.n] if want_rank else None, relaxed)
+                path, dec, acc = walk(ch, pn[m : m + t.n], nq[m : m + t.n], u_node[m : m + t.n],
+                                      rank[m : m + t.n] if want_rank else None, relaxed, p.alpha)
                 a, last = len(path), path[-1] if path else -1
                 j = f + 1 + last
                 final = "resample" if ch.get(last) else "bonus"
-                infos = [TokenInfo(t.tokens[i], lprn[m + i], math.log(pn[m + i]) if pn[m + i] < 1 else 0.0,
-                                   t.q[i] if t.q else None, "draft") for i in path]
-                infos.append(TokenInfo(tok[j], lpr[j], lpp[j], None, final))
+                before = lambda i: [(acc[c], pn[m + c]) for c in ch[t.parents[i]][: ch[t.parents[i]].index(i)]]  # rejected earlier siblings
+                infos = [TokenInfo(t.tokens[i], lprn[m + i], lq := math.log(pn[m + i]) if pn[m + i] < 1 else 0.0,
+                                   t.q[i] if t.q else None, "draft", behavior_logprob("draft", lq, before(i), acc[i], exact)) for i in path]
+                rejected = [(acc[c], pn[m + c]) for c in ch.get(last, [])]  # the final row's siblings, all rejected
+                infos.append(TokenInfo(tok[j], lpr[j], lpp[j], None, final, behavior_logprob(final, lpp[j], rejected, 0.0, exact)))
                 req.accepted.append(a)
                 if self.tele:
                     nodes = [dict(tok=t.tokens[i], parent=t.parents[i], p=pn[m + i], q=t.q[i] if t.q else None,
                                   u=u_node[m + i], d=dec[i]) for i in range(t.n)]
+                    emitted = [dict(tok=x.token, src=x.source, lp=x.sample_logprob, mu=x.behavior_logprob) for x in infos]
                     tele.append(dict(req=req.id, pos=len(req.out_tokens), depth=self.depth, topk=self.topk,
-                                     accepted=a, final=final, nodes=nodes))
+                                     accepted=a, final=final, nodes=nodes, emitted=emitted))
                 if a and path != list(range(a)):  # compact the accepted path into chain order
                     bs, blocks = self.config.block_size, req.table.blocks
                     phys = lambda q: blocks[q // bs] * bs + q % bs
@@ -384,8 +388,9 @@ class Engine:
             val = lp[idx, ntok]
             pn = torch.where(inn, torch.where(g[idx], (am[idx] == ntok).float(), val.exp()), pn)
             lprn = torch.where(inn, z[idx, ntok] - lse[idx], lprn)
-            if want_rank:
-                rank = torch.where(inn, (lp[idx] > val[:, None]).sum(-1).float(), rank)
+            if want_rank:  # only this chunk's nodes: lp[idx] over every node would be [M, V]
+                sel = inn.nonzero().squeeze(1)
+                rank[sel] = (lp[idx[sel]] > val[sel][:, None]).sum(-1).float()
             q = torch.zeros_like(z).index_put_((idx, ntok), inn.float() * mass, accumulate=True)
             if qs is not None:
                 qr, qp = qs
@@ -423,9 +428,9 @@ class Engine:
         ids = torch.tensor([t for r in reqs for t in r.ext_ids], dtype=torch.int64, device=self.device)
         hidden = torch.cat([r.ext_hidden for r in reqs])
         meta = AttnMeta.build(tables, n, bs, self.device, starts)
-        logits, h = self.drafter(ids, hidden, self.draft_kv, meta)
-        last = meta.last_token_idx
-        return logits[last], h[last]
+        last = meta.last_token_idx  # the head only at each request's last row: a prefill extend spans whole prompts
+        logits, h = self.drafter(ids, hidden, self.draft_kv, meta, logits_idx=last)
+        return logits, h[last]
 
     def _draft_forward(self, ids, hidden: torch.Tensor, meta: AttnMeta) -> tuple[torch.Tensor, torch.Tensor]:
         if self.draft_graphs is not None and self.draft_graphs.can_run(meta):

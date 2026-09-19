@@ -23,14 +23,23 @@ class SamplingParams:
     seed: int | None = None  # per-request RNG; None = random
     # exact: lossless (the emitted distribution equals plain sampling). relaxed: accept a
     # draft whenever p(draft) >= tau or the draft is in the target's top accept_topk --
-    # faster, and NOT the target's distribution any more.
+    # faster, deterministic, and NOT the target's distribution any more. power: accept
+    # with probability min(1, p / rest) ** alpha (alpha = 1 is exact, 0 accepts all);
+    # stochastic, so every target token keeps a nonzero behavior probability.
     acceptance: str = "exact"
     tau: float = 1.0
     accept_topk: int = 0
+    alpha: float = 1.0
     # argmax: point-mass proposals (chain and tree). sample: chain drafts drawn from the
     # head; the Leviathan min(1, p/q) test with residual norm(max(0, p - q)).
     draft_sampling: str = "argmax"
     logprobs: bool = False  # fill Request.logprobs
+
+    def __post_init__(self) -> None:
+        if self.acceptance not in ("exact", "relaxed", "power") or self.draft_sampling not in ("argmax", "sample"):
+            raise ValueError(f"unknown acceptance {self.acceptance!r} / draft_sampling {self.draft_sampling!r}")
+        if self.acceptance != "exact" and self.draft_sampling == "sample":
+            raise NotImplementedError("lossy acceptance has a behavior log-prob only for argmax proposals")
 
 
 @dataclass(slots=True)
@@ -40,6 +49,7 @@ class TokenInfo:
     sample_logprob: float  # log-prob under the (T, top-k, top-p) distribution it was drawn from; 0 when greedy
     draft_logprob: float | None  # the draft's log q(token) for accepted drafts
     source: str  # draft (accepted) | resample (row where a draft was rejected) | bonus (no draft tested at the row)
+    behavior_logprob: float = 0.0  # log mu(token | state): what the sampler emitted it with (spec/sampling.py)
 
 
 @dataclass

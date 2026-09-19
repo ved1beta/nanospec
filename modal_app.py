@@ -22,13 +22,15 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu22.04", add_python="3.12")
     .pip_install("torch==2.8.0", index_url="https://download.pytorch.org/whl/cu128")
     .pip_install("flashinfer-python")
-    .pip_install("transformers>=4.55", "safetensors", "huggingface_hub[hf_transfer]", "pytest", "accelerate")
+    .pip_install("transformers>=4.55", "safetensors", "huggingface_hub[hf_transfer]", "pytest", "accelerate", "datasets")
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": HF_CACHE})
     .add_local_dir(".", remote_path=REPO, ignore=["**/.git", "**/__pycache__", "**/.venv", "**/*.pyc"])
 )
 
 app = modal.App("nanospec", image=image)
 hf_cache = modal.Volume.from_name("nanospec-hf-cache", create_if_missing=True)
+runs = modal.Volume.from_name("nanospec-runs", create_if_missing=True)  # rl/grpo.py logs, telemetry, args
+RUNS = "/root/runs"
 
 
 @app.function(
@@ -125,3 +127,20 @@ def bench(engines: str = "nanospec,vllm,sglang", configs: str = "nospec,chain,tr
             rows = fns[e].remote(config=c, bs=bs, runs=runs)
             (out / f"{e}-{c}.jsonl").write_text(rows + "\n")
             print(f"{e}/{c}: {rows.count(chr(10)) + 1} rows")
+
+
+# ---------------------------------------------------------------------------- GRPO harness (rl/grpo.py)
+
+
+@app.function(gpu="H100", timeout=6 * 60 * 60, volumes={HF_CACHE: hf_cache, RUNS: runs}, secrets=_secrets)
+def grpo(name: str, args: str = "", model: str = "unsloth/Llama-3.2-1B-Instruct"):
+    """modal run --detach modal_app.py::grpo --name e0-static --args "--task gsm8k --steps 300 --draft frozen ..."
+    Logs land in the nanospec-runs volume under <name>/ (log.jsonl, telemetry.jsonl, args.json)."""
+    cmd = ["python", "-m", "rl.grpo", "--model", model, "--out", f"{RUNS}/{name}", *shlex.split(args)]
+    env = {**os.environ, "PYTHONPATH": REPO, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    print("$", " ".join(cmd), flush=True)
+    rc = subprocess.call(cmd, cwd=REPO, env=env)
+    runs.commit()
+    hf_cache.commit()
+    if rc != 0:
+        raise SystemExit(f"rl.grpo exited {rc}")

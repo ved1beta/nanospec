@@ -27,6 +27,25 @@ noise is ~1 ulp/step; `tests/diag_numerics.py` reproduces the measurement). Env 
 `NANOSPEC_MODEL`, `NANOSPEC_EAGLE`, `NANOSPEC_DEVICE`, `NANOSPEC_BACKEND` (`auto|sdpa|flashinfer`),
 `NANOSPEC_MAX_NEW`.
 
+## RL rollouts
+
+Every emitted token carries its target log-prob and its *behavior* log-prob `mu(a|s)`, the
+probability the (possibly lossy) speculative sampler emitted it, so a trainer can weight
+tokens by `pi/mu`. Acceptance rules: `exact` (lossless), `relaxed` (accept iff `p >= tau`
+or top-k; deterministic, so `mu = 1` on accepted drafts and the sampler has no support on
+the target's other tokens there) and `power` (accept with probability `min(1, p/rest)**alpha`;
+stochastic, full support, exact weights). `tests/test_behavior.py` measures both.
+
+`rl/grpo.py` is a ~400-line GRPO loop over the engine (GSM8K or a toy task) with the
+off-policy correction modes `none | exact | clipped | icepop | m2po`, a frozen-copy draft
+baseline with fixed-interval refresh, and per-step JSON logs (reward, tok/s, accepted
+length, IS statistics, KL to step 0):
+
+```
+python -m rl.grpo --task toy --steps 20 --draft frozen --acceptance power --alpha 0.3 --correction exact
+modal run --detach modal_app.py::grpo --name e0 --args "--task gsm8k --steps 300 --prompts 64 --group 8 --max-tokens 256 --draft frozen"
+```
+
 ## Benchmarks
 
 Same prompts (chat-templated MT-Bench), same `max_tokens`, greedy, for nanospec, vLLM, and

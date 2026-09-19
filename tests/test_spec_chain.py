@@ -39,9 +39,10 @@ class SelfDrafter:
         self.target = target
         self.config = self._Cfg(target)
 
-    def __call__(self, ids, hidden, kv, meta):
-        logits, _ = self.target(ids, kv, meta)
-        wrong = (meta.positions % 3 == 2).nonzero().flatten()
+    def __call__(self, ids, hidden, kv, meta, backend=None, logits_idx=None):
+        logits, _ = self.target(ids, kv, meta, backend=backend, logits_idx=logits_idx)
+        pos = meta.positions if logits_idx is None else meta.positions[logits_idx]
+        wrong = (pos % 3 == 2).nonzero().flatten()
         if len(wrong):
             top = logits[wrong].argmax(-1)
             logits[wrong] = -1e4

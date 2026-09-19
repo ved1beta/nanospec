@@ -109,10 +109,10 @@ class Eagle3Head(nn.Module):
 
     @torch.no_grad()
     def forward(
-        self, input_ids: torch.Tensor, hidden: torch.Tensor, kv: PagedKVCache, meta: AttnMeta, backend=None
+        self, input_ids: torch.Tensor, hidden: torch.Tensor, kv: PagedKVCache, meta: AttnMeta, backend=None, logits_idx=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """input_ids [N]; hidden [N, 3*H] (target taps, first call) or [N, H] (chain).
-        -> (draft logits [N, draft_vocab], pre-norm hidden [N, H] for the next chain step)"""
+        -> (draft logits [N or len(logits_idx), draft_vocab], pre-norm hidden [N, H] for the next chain step)"""
         if hidden.shape[-1] != self.config.hidden_size:
             hidden = self.fc(hidden)
         embeds = self.embed_tokens(input_ids)
@@ -121,7 +121,8 @@ class Eagle3Head(nn.Module):
         backend = backend or self.backend
         backend.plan(meta)
         h = self.midlayer(embeds, hidden, cos, sin, kv, meta, backend)
-        return self.lm_head(self.norm(h)), h
+        hn = self.norm(h)
+        return self.lm_head(hn if logits_idx is None else hn[logits_idx]), h
 
     def to_target_ids(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids + self.d2t[draft_ids]
