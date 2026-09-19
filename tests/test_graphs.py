@@ -52,7 +52,7 @@ def test_graph_step_matches_eager_step(ns, prompts):
     while eng.sched.has_work:
         running, new = eng.sched.next_batch()
         if new:  # mixed step: eager path, just advance it
-            eng._plain_step(running, new)
+            eng._run(running, new)
             continue
         for r in running:
             eng.alloc.append(r.id, 1)
@@ -60,7 +60,7 @@ def test_graph_step_matches_eager_step(ns, prompts):
         meta = AttnMeta.build([r.table for r in running], [1] * len(running), BLOCK_SIZE, eng.device, [r.committed for r in running])
         eager, _ = ns(torch.tensor(ids, device=eng.device), eng.kv, meta)
         (graph,) = eng.graphs.run(meta, ids)
-        graph = graph.clone()
+        graph = ns.lm_head(graph.clone())
         u = ((graph.float() - eager.float()).abs() / (2.0**-7 * eager.float().abs().amax(-1, keepdim=True))).max().item()
         worst, steps = max(worst, u), steps + 1
         seen.add(eng.graphs.bucket(len(running)))

@@ -123,7 +123,9 @@ class GraphRunner:
         i32 = lambda x: torch.tensor(x, dtype=torch.int32)
 
         masks = None
-        if self.masked:
+        if self.masked and torch.is_tensor(meta.masks):  # already flat: append the pad rows
+            masks = torch.cat([meta.masks, torch.ones(n_pad * R, dtype=torch.bool, device=self.device)])
+        elif self.masked:
             # every row gets an explicit mask: an all-causal batch must not fall back to
             # "no mask" (custom_mask -> None) on the masked wrapper
             masks = list(meta.masks) if meta.masks is not None else [None] * B

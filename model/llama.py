@@ -274,11 +274,13 @@ class LlamaForCausalLM(nn.Module):
         aux_layers: tuple[int, ...] = (),
         logits_idx: torch.Tensor | None = None,
         backend=None,
+        head: bool = True,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """input_ids [N] at meta.positions. -> (logits [N or len(logits_idx), V], aux hidden states)"""
+        """input_ids [N] at meta.positions. -> (logits [N or len(logits_idx), V], aux hidden
+        states); head=False returns the normed hidden [N, H] instead of logits."""
         backend = backend or self.backend
         backend.plan(meta)
         h, aux = self.model(input_ids, kv, meta, backend, aux_layers)
         if logits_idx is not None:
             h = h[logits_idx]
-        return self.lm_head(h), aux
+        return self.lm_head(h) if head else h, aux

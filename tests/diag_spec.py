@@ -43,7 +43,7 @@ def lockstep(tok, prompt_idx=8, steps=60):
 
         def hook(ids, meta, _o=orig, _n=name):
             out = _o(ids, meta)
-            cap[_n] = (out[0].clone(), list(ids), meta)
+            cap[_n] = (e.model.lm_head(out[0]).clone(), list(ids), meta)
             return out
 
         e._verify_forward = hook
@@ -53,7 +53,7 @@ def lockstep(tok, prompt_idx=8, steps=60):
     for step in range(steps):
         if rf.state == "done" or rs.state == "done":
             break
-        rf.drafts = list(rs.drafts)  # identical verify inputs
+        rf.tree = rs.tree  # identical verify inputs
         ef.step()
         es.step()
         lf, idf, mf = cap["fi"]
@@ -68,7 +68,7 @@ def lockstep(tok, prompt_idx=8, steps=60):
         if rf.out_tokens != rs.out_tokens:
             print(f"  out_tokens differ: fi {rf.out_tokens[-8:]} sd {rs.out_tokens[-8:]}")
             break
-        rf.drafts = list(rs.drafts)
+        rf.tree = rs.tree
 
 
 def drafter_probe(tok):

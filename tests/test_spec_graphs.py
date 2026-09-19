@@ -53,18 +53,20 @@ def test_verify_graph_matches_eager_per_step(ns, drafter, prompts, topk):
         import torch as _t
 
         input_ids = _t.tensor(ids, dtype=_t.int64, device=eng.device)
-        lg_e, aux_e = ns(input_ids, eng.kv, eng._materialize(meta), aux_layers=eng.taps)
-        aux_e = _t.cat(aux_e, -1)
-        if eng.verify_graphs.can_run(meta):
+        h_e, aux_e = ns(input_ids, eng.kv, eng._materialize(meta), aux_layers=eng.taps, head=False)
+        aux_e, lg_e = _t.cat(aux_e, -1), ns.lm_head(h_e)
+        runner = eng.verify_graphs[eng.config.num_draft + 1]
+        if runner.can_run(meta):
             nonlocal worst, n_graph
-            lg_g, aux_g = eng.verify_graphs.run(meta, ids)
+            lg_g, aux_g = runner.run(meta, ids)
+            lg_g = ns.lm_head(lg_g)
             u = ((lg_g.float() - lg_e.float()).abs() / (2.0**-7 * lg_e.float().abs().amax(-1, keepdim=True))).max().item()
             ua = ((aux_g.float() - aux_e.float()).abs() / (2.0**-7 * aux_e.float().abs().amax(-1, keepdim=True))).max().item()
             worst, n_graph = max(worst, u, ua), n_graph + 1
             # FA2 masked (graph) vs FA3 causal (eager) read 2-30 ulps here; the "no mask"
             # bug read 90-137. The lossless end-to-end tests above are the gate.
             assert u <= 64 and ua <= 64, f"rows {len(ids)} qo {meta.qo_lens} kv {meta.seq_lens}: logits {u:.2f} aux {ua:.2f} ulps"
-        return lg_e, aux_e
+        return h_e, aux_e
 
     eng._verify_forward = both
     while eng.sched.has_work:
@@ -80,7 +82,7 @@ def test_verify_runner_matrix(ns, prompts):
     both orders of first use."""
     from engine.graphs import GraphRunner
     from kv.cache import AttnMeta
-    from spec.tree import verify_mask
+    from spec.tree import ancestors, flat_masks
 
     R = DEPTH + 1
     eng = _engine(ns, None, 0, False)  # just for kv/alloc; no graphs
@@ -102,7 +104,10 @@ def test_verify_runner_matrix(ns, prompts):
                 ns(torch.tensor(prompts[b][:1] * L, device=eng.device), eng.kv, m0)
             reqs.append((t, L))
         rows = [([*range(L, L + R)], [*range(L, L + R)], L + R) for _, L in reqs]
-        masks = [verify_mask(L, list(range(-1, R - 2)), eng.device) if explicit else None for _, L in reqs]
+        masks = None
+        if explicit:
+            A = ancestors(torch.tensor([list(range(-1, R - 2))] * B, device=eng.device), R - 1)
+            masks = flat_masks([L for _, L in reqs], torch.cat([torch.zeros_like(A[:, :1]), A], 1), 1)
         meta = AttnMeta.from_rows([t for t, _ in reqs], rows, BLOCK_SIZE, eng.device, masks)
         ids = [prompts[0][i % len(prompts[0])] for i in range(B * R)]
         lg_e, aux_e = ns(torch.tensor(ids, device=eng.device), eng.kv, meta, aux_layers=runner.taps)

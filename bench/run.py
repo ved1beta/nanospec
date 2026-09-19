@@ -1,8 +1,12 @@
-"""One harness, three engines. Same prompts, same max_tokens, greedy.
+"""One harness, three engines. Same prompts, same max_tokens, greedy by default.
 
-    python -m bench.run nanospec --config nospec|chain|tree --bs 1 8 32
+    python -m bench.run nanospec --config nospec|chain|tree --bs 1 8 32 512
+    python -m bench.run nanospec --config chain --bs 512 --temperature 1.0 --row-budget 1024
     python -m bench.run vllm     --config nospec|chain
     python -m bench.run sglang   --config nospec|chain|tree
+
+`bs` is the number of concurrent sequences (max_running); nanospec admits at most 8 new
+prompts per step. --n-samples repeats every prompt (64 x 8 = the GRPO group shape).
 
 Each run prints one JSON line per (engine, config, bs): output tok/s, TPOT ms, mean
 accepted length per step, plus versions and commit hash. `bench/table.py` folds them.
@@ -54,7 +58,8 @@ def torch_gpu_name() -> str:
 # ---------------------------------------------------------------------------- nanospec
 
 
-def run_nanospec(config: str, batch_sizes: list[int], max_tokens: int, runs: int):
+def run_nanospec(config: str, batch_sizes: list[int], max_tokens: int, runs: int, temperature: float = 0.0,
+                 n_samples: int = 1, row_budget: int = 0):
     import torch
     from transformers import AutoTokenizer
 
@@ -65,16 +70,17 @@ def run_nanospec(config: str, batch_sizes: list[int], max_tokens: int, runs: int
 
     depth, topk = CONFIGS[config]
     tok = AutoTokenizer.from_pretrained(TARGET)
-    prompts = [tok(p, add_special_tokens=False).input_ids for p in chat_prompts(tok)]
+    prompts = [tok(p, add_special_tokens=False).input_ids for p in chat_prompts(tok) for _ in range(n_samples)]
     model = load_model(TARGET, "cuda")
     drafter = load_eagle3(EAGLE, model) if depth else None
-    num_blocks = 64 * (2048 // 16)
+    num_blocks = 512 * (1024 // 16)  # 512 sequences of 1k tokens; the reservation throttles admission beyond that
     for bs in batch_sizes:
         for run in range(runs):
-            eng = Engine(model, EngineConfig(num_blocks, 16, max_admit=bs, cuda_graphs=not depth, spec_depth=depth, spec_topk=topk), drafter)
+            eng = Engine(model, EngineConfig(num_blocks, 16, max_admit=min(bs, 8), max_running=bs, spec_depth=depth,
+                                             spec_topk=topk, spec_row_budget=row_budget), drafter)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            reqs = [eng.add(p, SamplingParams(max_tokens)) for p in prompts]
+            reqs = [eng.add(p, SamplingParams(max_tokens, temperature=temperature, seed=i)) for i, p in enumerate(prompts)]
             while eng.sched.has_work:
                 eng.step()
             torch.cuda.synchronize()
@@ -82,7 +88,8 @@ def run_nanospec(config: str, batch_sizes: list[int], max_tokens: int, runs: int
             n_out = sum(len(r.out_tokens) for r in reqs)
             steps = sum(len(r.accepted) for r in reqs)
             acc = (sum(sum(r.accepted) for r in reqs) / steps + 1) if steps else None
-            report("nanospec", config, bs, len(prompts), n_out, dt, acc, run=run, torch=torch.__version__)
+            report("nanospec", config, bs, len(prompts), n_out, dt, acc, run=run, torch=torch.__version__,
+                   temperature=temperature, row_budget=row_budget)
             del eng
             torch.cuda.empty_cache()
 
@@ -159,5 +166,11 @@ if __name__ == "__main__":
     ap.add_argument("--bs", type=int, nargs="+", default=[1, 8, 32])
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--runs", type=int, default=3)
+    ap.add_argument("--temperature", type=float, default=0.0)  # nanospec only
+    ap.add_argument("--n-samples", type=int, default=1)  # nanospec only
+    ap.add_argument("--row-budget", type=int, default=0)  # nanospec only
     a = ap.parse_args()
-    {"nanospec": run_nanospec, "vllm": run_vllm, "sglang": run_sglang}[a.engine](a.config, a.bs, a.max_tokens, a.runs)
+    if a.engine == "nanospec":
+        run_nanospec(a.config, a.bs, a.max_tokens, a.runs, a.temperature, a.n_samples, a.row_budget)
+    else:
+        {"vllm": run_vllm, "sglang": run_sglang}[a.engine](a.config, a.bs, a.max_tokens, a.runs)

@@ -58,7 +58,7 @@ class AttnMeta:
     kv_last_page_len_host: list[int] = None
     positions_host: list[int] = None
     slots_host: list[int] = None
-    masks: list[torch.Tensor | None] = None  # per request bool [qo, kv]; None = causal
+    masks: list[torch.Tensor | None] | torch.Tensor = None  # per request bool [qo, kv] (None = causal), or all of them flat
 
     @staticmethod
     def causal_mask(q: int, k: int, device=None) -> torch.Tensor:
@@ -66,10 +66,19 @@ class AttnMeta:
         qi = torch.arange(k - q, k, device=device)[:, None]
         return torch.arange(k, device=device)[None, :] <= qi
 
+    def mask(self, i: int) -> torch.Tensor | None:
+        """Request i's [qo, kv] mask (None = causal)."""
+        if self.masks is None or not torch.is_tensor(self.masks):
+            return None if self.masks is None else self.masks[i]
+        off = sum(q * k for q, k in zip(self.qo_lens[:i], self.seq_lens[:i]))
+        return self.masks[off : off + self.qo_lens[i] * self.seq_lens[i]].view(self.qo_lens[i], self.seq_lens[i])
+
     def flat_mask(self, device) -> torch.Tensor | None:
         """All requests' masks flattened (FlashInfer's custom_mask), causal ones made
         explicit. None when no request has a mask, so eager callers can use the plain
         causal kernels; graph runners must materialise masks themselves."""
+        if torch.is_tensor(self.masks):
+            return self.masks
         if self.masks is None or all(m is None for m in self.masks):
             return None
         return torch.cat([
@@ -108,7 +117,7 @@ class AttnMeta:
         rows: list[tuple[list[int], list[int], int]],
         block_size: int,
         device,
-        masks: list[torch.Tensor | None] | None = None,
+        masks: list[torch.Tensor | None] | torch.Tensor | None = None,
     ) -> "AttnMeta":
         """Per request: (RoPE position per query row, logical slot per query row, kv_len).
         Query rows attend logical slots [0, kv_len) under masks[i] (None = causal, aligned

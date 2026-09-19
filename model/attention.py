@@ -28,7 +28,7 @@ class SdpaBackend:
             k, v = kv.gather(layer, blocks, kv_len)
             qi = q[qs:qe].transpose(0, 1)[None]  # [1, H, S, D]
             ki, vi = k.transpose(0, 1)[None], v.transpose(0, 1)[None]
-            mask = m.masks[i] if m.masks is not None else None
+            mask = m.mask(i)
             if mask is not None:
                 o = F.scaled_dot_product_attention(qi, ki, vi, attn_mask=mask, enable_gqa=True)
             elif q_len == 1:

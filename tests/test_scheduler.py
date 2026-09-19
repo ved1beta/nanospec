@@ -17,19 +17,25 @@ def test_staggered_admission_and_decode_order():
     run, new = s.next_batch()
     assert ([r.id for r in run], [r.id for r in new]) == ([0, 1], [2])
     assert [s.alloc.get(r.id).seq_len for r in s.running] == [5, 5, 5]  # per-step reservation is the engine's
+    s.max_running = 3
+    s.add(_req(3, 5))
+    assert s.next_batch()[1] == []  # concurrency cap
 
 
 def test_admission_waits_for_blocks_and_finish_frees():
+    """Admission reserves prompt + max_tokens (4 here), so append() never fails mid-decode."""
     alloc = BlockAllocator(num_blocks=4, block_size=4)
     s = Scheduler(alloc, max_admit=8)
-    s.add(_req(0, 12))  # 3 blocks
-    s.add(_req(1, 8))  # 2 blocks: doesn't fit alongside
-    s.add(_req(2, 4))  # 1 block: would fit, but FIFO -- stays behind 1
+    s.add(_req(0, 12))  # 12 + 4 -> 4 blocks
+    s.add(_req(1, 6))  # 6 + 4 -> 3 blocks: doesn't fit alongside
+    s.add(_req(2, 1))  # 1 + 4 -> 2 blocks: would fit, but FIFO -- stays behind 1
     assert [r.id for r in s.next_batch()[1]] == [0]
     assert [r.id for r in s.waiting] == [1, 2]
     s.finish(s.running[0])
     assert alloc.num_free == 4
-    assert [r.id for r in s.next_batch()[1]] == [1, 2]
+    assert [r.id for r in s.next_batch()[1]] == [1]  # 3 reserved, 1 block of headroom left
+    s.finish(s.running[0])
+    assert [r.id for r in s.next_batch()[1]] == [2]
     for r in list(s.running):
         s.finish(r)
     assert not s.has_work and alloc.num_free == 4

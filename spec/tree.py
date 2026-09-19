@@ -1,9 +1,11 @@
 """Static draft tree: topk nodes at each of `depth` levels (EAGLE-2 selection: the
 global top-k children by cumulative log-prob at every level). N = topk * depth nodes.
+A chain is the tree with linear parents.
 
 Node i has token[i], parent[i] (-1 = the root, i.e. the last committed token) and
 depth[i] = 1 + depth[parent]. Verify rows are [root] + nodes; row r attends the prefix,
-the root, and its ancestors-or-self. Retrieval: walk parents from any node to the root.
+the root, and its ancestors-or-self. Node i is scored by row 1 + parent[i] (the root row
+for parent -1); acceptance is spec/sampling.walk.
 """
 
 from __future__ import annotations
@@ -18,10 +20,22 @@ class Tree:
     tokens: list[int]
     parents: list[int]
     depths: list[int]
+    q: list[float] | None = None  # the draft's log-prob of each node's token
+
+    @classmethod
+    def chain(cls, tokens: list[int], q: list[float] | None = None) -> "Tree":
+        return cls(tokens, list(range(-1, len(tokens) - 1)), list(range(1, len(tokens) + 1)), q)
 
     @property
     def n(self) -> int:
         return len(self.tokens)
+
+    def children(self) -> dict[int, list[int]]:
+        """node -> children in node order; -1 is the root."""
+        out: dict[int, list[int]] = {}
+        for i, p in enumerate(self.parents):
+            out.setdefault(p, []).append(i)
+        return out
 
     def ancestors(self, i: int) -> list[int]:
         """Ancestors-or-self of node i, root-side first."""
@@ -32,56 +46,30 @@ class Tree:
         return path[::-1]
 
 
-def ancestor_matrix(parents: list[int], device=None) -> torch.Tensor:
-    """[N, N] bool: A[i, j] = j is an ancestor-or-self of i. Built on the CPU (N <= 32,
-    a Python loop beats N tiny GPU kernels) and moved once if a device is given."""
-    n = len(parents)
-    a = torch.eye(n, dtype=torch.bool)
-    for i, p in enumerate(parents):
-        if p >= 0:
-            a[i] |= a[p]  # parents precede children, so a[p] is complete
-    return a.to(device) if device is not None else a
+def ancestors(parents: torch.Tensor, depth: int) -> torch.Tensor:
+    """parents [B, N] (-1 = root) -> A [B, N, N] bool: A[b, i, j] = j is an ancestor-or-self
+    of i. depth-1 pointer-chasing steps cover every node at depth <= depth."""
+    B, N = parents.shape
+    b, i = torch.arange(B, device=parents.device)[:, None], torch.arange(N, device=parents.device)[None, :]
+    A = torch.eye(N, dtype=torch.bool, device=parents.device).expand(B, N, N).clone()
+    anc = parents
+    for _ in range(depth - 1):
+        A[b, i, anc.clamp_min(0)] |= anc >= 0
+        anc = parents.gather(1, anc.clamp_min(0)).where(anc >= 0, anc)
+    return A
 
 
-def verify_mask(prefix_len: int, parents: list[int], device) -> torch.Tensor:
-    """[1+N, prefix_len+1+N] bool for rows [root] + nodes over kv = prefix + root + nodes."""
-    n = len(parents)
-    m = torch.zeros(1 + n, prefix_len + 1 + n, dtype=torch.bool)
-    m[:, : prefix_len + 1] = True  # everyone sees the prefix and the root
-    m[1:, prefix_len + 1 :] = ancestor_matrix(parents)
-    return m.to(device, non_blocking=True) if device is not None else m
-
-
-def draft_mask(prefix_len: int, parents: list[int], rows: list[int], n_slots: int, device) -> torch.Tensor:
-    """[len(rows), prefix_len+n_slots] bool for draft rows = nodes `rows` (as inputs) over
-    kv = draft prefix + the tree's slot region: prefix + ancestors-or-self."""
-    a = ancestor_matrix(parents)
-    m = torch.zeros(len(rows), prefix_len + n_slots, dtype=torch.bool)
-    m[:, :prefix_len] = True
-    m[:, prefix_len : prefix_len + a.shape[0]] = a[rows]
-    return m.to(device, non_blocking=True) if device is not None else m
-
-
-def longest_accepted(tree: Tree, argmax: list[int]) -> tuple[list[int], int]:
-    """Greedy acceptance. argmax[0] is the target's choice at the root row, argmax[1+i]
-    at node i. Returns (accepted node indices root->leaf, bonus token)."""
-    children: dict[int, list[int]] = {}
-    for i, p in enumerate(tree.parents):
-        children.setdefault(p, []).append(i)
-    path, cur, want = [], -1, argmax[0]
-    while True:
-        nxt = next((c for c in children.get(cur, []) if tree.tokens[c] == want), None)
-        if nxt is None:
-            return path, want
-        path.append(nxt)
-        cur, want = nxt, argmax[1 + nxt]
-
-
-def select_children(
-    scores: torch.Tensor, cand_tokens: torch.Tensor, cand_parents: list[int], topk: int
-) -> tuple[list[int], list[int], torch.Tensor]:
-    """scores [C] cumulative log-probs of C candidate children (parent index per
-    candidate). Keeps the global top-k: returns (tokens, parents, scores) of the kept."""
-    k = min(topk, scores.numel())
-    best = scores.topk(k).indices
-    return cand_tokens[best].tolist(), [cand_parents[i] for i in best.tolist()], scores[best]
+def flat_masks(prefix: list[int], rows: torch.Tensor, extra: int) -> torch.Tensor:
+    """Per request b an [R, prefix[b] + extra + N] block: True over the first
+    prefix[b] + extra columns (the prefix, and the root for a verify), then rows[b]
+    ([B, R, N] bool over the tree slots); flattened and concatenated (FlashInfer's
+    custom_mask layout). Built on the device with no per-request launches."""
+    B, R, N = rows.shape
+    dev = rows.device
+    L = torch.tensor(prefix, device=dev) + extra
+    W = L + N
+    total = sum(R * (p + extra + N) for p in prefix)
+    b = torch.repeat_interleave(torch.arange(B, device=dev), R * W, output_size=total)
+    local = torch.arange(total, device=dev) - torch.cat([W.new_zeros(1), (R * W).cumsum(0)])[b]
+    r, j = local // W[b], local % W[b] - L[b]
+    return (j < 0) | rows[b, r, j.clamp_min(0)]
