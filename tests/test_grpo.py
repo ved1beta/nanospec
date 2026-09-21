@@ -15,7 +15,7 @@ class _A:
     correction, is_clip, icepop_delta, m2po_delta = "none", 2.0, 0.5, 0.04
 
 
-@pytest.mark.parametrize("mode", ["none", "exact", "clipped", "icepop", "m2po"])
+@pytest.mark.parametrize("mode", ["none", "exact", "snis", "shuffle", "clipped", "icepop", "m2po"])
 def test_token_weights(mode):
     a = _A()
     a.correction = mode
@@ -27,6 +27,10 @@ def test_token_weights(mode):
         assert torch.equal(w, mask)
     elif mode == "exact":
         assert torch.allclose(w, log_w.exp() * mask)
+    elif mode == "snis":
+        assert w.sum() == pytest.approx(mask.sum()) and torch.allclose(w / (log_w.exp() * mask).clamp_min(1e-9) * mask, (w > 0) * w.sum() / (log_w.exp() * mask).sum())
+    elif mode == "shuffle":
+        assert sorted(w[mask > 0].tolist()) == sorted((log_w.exp() * mask)[mask > 0].tolist())
     elif mode == "clipped":
         assert w.max() <= 2.0 and st["clip_frac"] == pytest.approx(1 / 6)
     elif mode == "icepop":

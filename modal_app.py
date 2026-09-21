@@ -139,8 +139,35 @@ def grpo(name: str, args: str = "", model: str = "unsloth/Llama-3.2-1B-Instruct"
     cmd = ["python", "-m", "rl.grpo", "--model", model, "--out", f"{RUNS}/{name}", *shlex.split(args)]
     env = {**os.environ, "PYTHONPATH": REPO, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     print("$", " ".join(cmd), flush=True)
-    rc = subprocess.call(cmd, cwd=REPO, env=env)
+    proc = subprocess.Popen(cmd, cwd=REPO, env=env)
+    while proc.poll() is None:  # commit the log every minute: a run killed by a spend limit or preemption keeps its steps
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            runs.commit()
     runs.commit()
     hf_cache.commit()
-    if rc != 0:
-        raise SystemExit(f"rl.grpo exited {rc}")
+    if proc.returncode != 0:
+        raise SystemExit(f"rl.grpo exited {proc.returncode}")
+
+
+# ---------------------------------------------------------------------------- analysis on the volume (CPU, no GPU cost)
+
+slim = modal.Image.debian_slim(python_version="3.12").add_local_dir(".", remote_path=REPO, ignore=["**/.git", "**/__pycache__", "**/.venv", "**/*.pyc"])
+
+
+@app.function(image=slim, timeout=60 * 60, volumes={RUNS: runs}, cpu=2)
+def kl(name: str, alpha: float):
+    """modal run modal_app.py::kl --name e2-a0.3-exact --alpha 0.3 -> measured per-token KL(pi || mu) from telemetry."""
+    subprocess.check_call(["python", "-m", "rl.kl", f"{RUNS}/{name}/telemetry.jsonl", "--alpha", str(alpha), "--out", f"{RUNS}/{name}/kl.json"],
+                          cwd=REPO, env={**os.environ, "PYTHONPATH": REPO})
+    runs.commit()
+
+
+@app.function(gpu="H100", timeout=2 * 60 * 60, volumes={HF_CACHE: hf_cache, RUNS: runs}, secrets=_secrets)
+def sampler(name: str, args: str = "", model: str = "unsloth/Llama-3.2-1B-Instruct"):
+    """modal run modal_app.py::sampler --name sweep-e0 --args "--checkpoints e0-exact-none/policy_50.pt ..."
+    Fixed-policy rollouts under each acceptance setting (rl/sampler_sweep.py): the sampler effect alone."""
+    cmd = ["python", "-m", "rl.sampler_sweep", "--model", model, "--runs-dir", RUNS, "--out", f"{RUNS}/{name}", *shlex.split(args)]
+    subprocess.check_call(cmd, cwd=REPO, env={**os.environ, "PYTHONPATH": REPO})
+    runs.commit()

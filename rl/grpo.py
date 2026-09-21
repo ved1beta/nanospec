@@ -10,6 +10,11 @@ PPO-clip surrogate with a per-token off-policy weight w_t = pi_old(a_t|s_t) / mu
 
     none     w = 1 (pretend the rollouts are on-policy)
     exact    w
+    snis     w * N / sum(w): the same relative weighting with mean 1, so the gradient scale
+             matches the uncorrected run (the control for "the weights just shrink the step")
+    shuffle  the exact weights permuted at random across the batch's tokens: same mean, same
+             ESS, no information about which token they belong to (the control for "the
+             corrected run drifts less because of the weights' scale or variance")
     clipped  min(w, C)                      (truncated IS, Yao et al. 2025)
     icepop   1 where |log w| <= delta, else the token is masked  (Ring-1T / IcePop)
     m2po     mask the largest |log w| tokens until the batch's E[(w - 1)^2] <= delta, w on the rest
@@ -56,7 +61,7 @@ def parse(argv=None) -> argparse.Namespace:
     ap.add_argument("--opt-steps", type=int, default=1, help="optimizer steps per rollout batch (minibatches)")
     ap.add_argument("--beta", type=float, default=0.0, help="KL(pi || pi_0) penalty (k3); pi_0 kept only if > 0 or --kl-every")
     ap.add_argument("--kl-every", type=int, default=1, help="log KL(pi_old || pi_0) on the rollouts every k steps (0 = never)")
-    ap.add_argument("--correction", default="none", choices=["none", "exact", "clipped", "icepop", "m2po"])
+    ap.add_argument("--correction", default="none", choices=["none", "exact", "snis", "shuffle", "clipped", "icepop", "m2po"])
     ap.add_argument("--is-clip", type=float, default=2.0)
     ap.add_argument("--icepop-delta", type=float, default=0.5, help="|log w| beyond which a token is masked")
     ap.add_argument("--m2po-delta", type=float, default=0.04, help="bound on E[(w-1)^2] over the kept tokens")
@@ -75,6 +80,7 @@ def parse(argv=None) -> argparse.Namespace:
     ap.add_argument("--cuda-graphs", action="store_true")
     ap.add_argument("--backend", default="auto")
     ap.add_argument("--eval-every", type=int, default=0)
+    ap.add_argument("--save-every", type=int, default=0, help="save the policy (bf16 state dict) every k steps to <out>/policy_<step>.pt")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default=None)
     ap.add_argument("--fp32", action="store_true", help="train in fp32 (default: bf16 params with fp32 Adam via autocast)")
@@ -99,6 +105,13 @@ def token_weights(log_w: torch.Tensor, mask: torch.Tensor, args) -> tuple[torch.
     keep = mask.clone()
     if args.correction == "none":
         w = mask.clone()
+    elif args.correction == "snis":
+        w = w * n / w.sum().clamp_min(1e-12)
+    elif args.correction == "shuffle":
+        live = mask.flatten().nonzero().squeeze(1)
+        flat = w.flatten().clone()
+        flat[live] = flat[live[torch.randperm(len(live))]]
+        w = flat.view_as(w)
     elif args.correction == "clipped":
         w = w.clamp_max(args.is_clip)
     elif args.correction == "icepop":
@@ -251,6 +264,7 @@ def main(argv=None) -> None:
     trainer = Trainer(args, tok, device)
     engine.update_weights(trainer.state_bf16(keys))  # the engine serves exactly the trainer's weights from step 0
     log = open(out / "log.jsonl", "a")
+    seqlog = open(out / "seqs.jsonl", "a")
     print(f"[grpo] {args.task} on {args.model} | {args.prompts}x{args.group} x {args.max_tokens} tok | draft={args.draft} "
           f"depth={cfg.spec_depth} topk={cfg.spec_topk} acceptance={args.acceptance} tau={args.tau} topk={args.accept_topk} alpha={args.alpha} "
           f"| correction={args.correction} | {device}", flush=True)
@@ -277,6 +291,10 @@ def main(argv=None) -> None:
         # target's mass under the deterministic relaxed rule (the full-length product is too heavy-tailed to read)
         mass = float(torch.stack([log_w[i, n_prompt[i] - 1 : n_prompt[i] + 7].sum().exp() for i in range(len(reqs))]).mean())
 
+        # per-sequence record: reward, output length, sum of log w (the sequence ratio pi_old / mu), accepted / step
+        seqlog.write(json.dumps({"step": step, "reward": rewards.tolist(), "len": [len(r.out_tokens) for r in reqs],
+                                 "logw": [float(log_w[i, n_prompt[i] - 1 : n_prompt[i] - 1 + len(r.logprobs)].sum()) for i, r in enumerate(reqs)],
+                                 "acc": [sum(r.accepted) / max(len(r.accepted), 1) for r in reqs]}) + "\n")
         rec = {"step": step, "reward": float(rewards.mean()), "reward_std": float(rewards.std()), "frac_solved": float((rewards > 0.999).float().mean()),
                "groups_with_signal": float((R.std(1) > 0).float().mean()), "mass": mass, **rs}
         if trainer.ref is not None and args.kl_every and step % args.kl_every == 0:
@@ -297,6 +315,8 @@ def main(argv=None) -> None:
         rec["step_s"] = time.perf_counter() - t_step
         if args.eval_every and (step + 1) % args.eval_every == 0:
             rec["eval_acc"] = evaluate(engine, task, args)
+        if args.save_every and (step + 1) % args.save_every == 0:
+            torch.save({k: v.cpu() for k, v in trainer.state_bf16(keys).items()}, out / f"policy_{step + 1}.pt")
         log.write(json.dumps(rec) + "\n")
         log.flush()
         print(f"[step {step:4d}] reward {rec['reward']:.3f} solved {rec['frac_solved']:.2f} | {rs['tok_s']:.0f} tok/s acc {rs['accepted']:.2f} "
@@ -305,6 +325,7 @@ def main(argv=None) -> None:
               f"| {rec['step_s']:.1f}s", flush=True)
     (out / "sample.txt").write_text("\n---\n".join(t for t in texts[:8]))
     log.close()
+    seqlog.close()
 
 
 @torch.no_grad()
